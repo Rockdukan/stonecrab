@@ -1,5 +1,8 @@
 import argparse
 import ast
+import contextlib
+import ftplib
+import json
 import email.message
 import email.utils
 import hmac
@@ -8,12 +11,19 @@ import operator
 import os
 import re
 import secrets
+import platform
 import smtplib
+import socket
+import ssl
 import string
+import subprocess
 import sys
+import threading
 import time
+import types
 import uuid
 import urllib.parse
+import urllib.request
 from datetime import datetime
 from http.cookies import SimpleCookie
 from inspect import isclass, isfunction
@@ -21,13 +31,17 @@ from pathlib import Path
 
 try:
     import settings
-except Exception:
-    with open("settings.py", "w", encoding="utf-8") as f:
-        print("\033[33m[WARNING]: \033[33m File settings.py empty\033[0m")
+except ImportError:
+    _cwd = os.getcwd()
+    settings = types.SimpleNamespace(
+        PROJECT_DIR=_cwd,
+        MEDIA_URL="/media/",
+        MEDIA_DIR=os.path.join(_cwd, "media"),
+        STATIC_URL="/static/",
+        STATIC_DIR=os.path.join(_cwd, "static"),
+        TEMPLATE_DIRS=os.path.join(_cwd, "templates"),
+        MIDDLEWARE=[])
 
-# TODO: Указать конкретный тип исключения при импорте settings
-# TODO: Подумать над добавлением библиотек для работы с TFTP, FTP, SNMP, Telnet, SSH, PDF, DjVu
-# TODO: Написать документацию
 # TODO: Написать тесты
 # TODO: Посмотреть видео про параллельный запуск скриптов, попробовать внедрить
 # TODO: Сделать бенчмарк с Flask, Bottle, Web2py, Sanic, Tornado, Falcon, Pyramid, Django
@@ -68,7 +82,14 @@ def flatten_parse_result(qs_dict):
     return out
 
 
-def build_set_cookie_value(name, value, max_age=None, path="/", httponly=True):
+def build_set_cookie_value(
+    name,
+    value,
+    max_age=None,
+    path="/",
+    httponly=True,
+    secure=False,
+    samesite="Lax",):
     """
     Формирует значение одного заголовка Set-Cookie (без префикса имени заголовка).
 
@@ -78,6 +99,8 @@ def build_set_cookie_value(name, value, max_age=None, path="/", httponly=True):
         max_age: Необязательный Max-Age в секундах.
         path: Атрибут Path.
         httponly: Добавлять ли флаг HttpOnly.
+        secure: Флаг Secure (обычно True за HTTPS).
+        samesite: Значение SameSite (Lax, Strict, None).
 
     Returns:
         Строка тела cookie для заголовка Set-Cookie.
@@ -87,7 +110,12 @@ def build_set_cookie_value(name, value, max_age=None, path="/", httponly=True):
         parts.append(f"Max-Age={int(max_age)}")
     if httponly:
         parts.append("HttpOnly")
-    parts.append("SameSite=Lax")
+    if secure:
+        parts.append("Secure")
+    if samesite and str(samesite).lower() != "none":
+        parts.append(f"SameSite={samesite}")
+    elif str(samesite).lower() == "none":
+        parts.append("SameSite=None")
     return "; ".join(parts)
 
 
@@ -156,8 +184,7 @@ def parse_multipart_body(body, boundary, default_charset="utf-8"):
             files[name] = {
                 "filename": filename,
                 "content_type": ctype,
-                "data": raw_body,
-            }
+                "data": raw_body}
         else:
             charset = default_charset
             if "charset=" in ctype.lower():
@@ -170,6 +197,82 @@ def parse_multipart_body(body, boundary, default_charset="utf-8"):
 
 
 CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+
+_CACHE_LOCK = threading.Lock()
+_RESPONSE_CACHE = {}
+_IDEMPOTENCY_CACHE = {}
+_RATE_BUCKET = {}
+
+
+def log_event(event, **fields):
+    """Пишет одну JSON-строку в stderr (структурный лог)."""
+    row = {"event": event, "ts": time.time(), **fields}
+    sys.stderr.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def parse_json_body(request):
+    """Разбор тела как JSON; при ошибке возвращает None."""
+    if not request.body:
+        return None
+    try:
+        raw = request.body.decode(request.charset, errors="replace")
+    except LookupError:
+        raw = request.body.decode("utf-8", errors="replace")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def validate_payload(data, schema):
+    """
+    Простая проверка словаря по схеме.
+
+    schema: имя -> тип (type) или кортеж типов, либо callable(value) -> bool.
+    Отсутствующий ключ с типом int/str/... считается ошибкой; для optional используйте callable.
+    """
+    errors = []
+    if not isinstance(data, dict):
+        return ["payload must be dict"]
+    for key, spec in schema.items():
+        val = data.get(key)
+        if val is None or val == "":
+            errors.append(f"missing:{key}")
+            continue
+        if isinstance(spec, (type, tuple)):
+            if not isinstance(val, spec):
+                errors.append(f"type:{key}")
+        elif callable(spec):
+            try:
+                if not spec(val):
+                    errors.append(f"invalid:{key}")
+            except Exception:
+                errors.append(f"check:{key}")
+        else:
+            errors.append(f"bad_schema:{key}")
+    return errors
+
+
+def build_openapi_spec(routes):
+    """Минимальная OpenAPI 3.0: paths и HTTP-методы из @route / View."""
+    paths = {}
+    for path, handler in sorted(routes.items(), key=lambda x: x[0]):
+        p = path.rstrip("/") or "/"
+        entry = {}
+        if isclass(handler):
+            allowed = getattr(handler, STONE_CRAB_METHODS, None) or frozenset(("GET", "HEAD", "OPTIONS"))
+            for m in sorted(allowed):
+                entry[m.lower()] = {
+                    "summary": handler.__name__,
+                    "responses": {"200": {"description": "OK"}}}
+        else:
+            allowed = getattr(handler, STONE_CRAB_METHODS, frozenset(("GET", "HEAD", "OPTIONS")))
+            for m in sorted(allowed):
+                entry[m.lower()] = {
+                    "summary": getattr(handler, "__name__", "handler"),
+                    "responses": {"200": {"description": "OK"}}}
+        paths[p] = entry
+    return {"openapi": "3.0.0", "info": {"title": "StoneCrab", "version": "1.0"}, "paths": paths}
 
 # **********************************************************************
 # ***************************** Status codes ***************************
@@ -200,8 +303,7 @@ STATUS_CODES = {
     501: "Not Implemented",
     502: "Bad Gateway",
     503: "Service Unavailable",
-    504: "Gateway Time-out",
-}
+    504: "Gateway Time-out"}
 
 
 # Имена атрибутов, которые выставляет декоратор route()
@@ -249,9 +351,7 @@ def wrap_view_method_guard(view_callable, allowed_methods):
     def guarded(request, response, **kwargs):
         if request.method not in allowed:
             response.status_code = 405
-            response.headers.setdefault(
-                "Content-Type", f"text/plain; charset={response.charset}"
-            )
+            response.headers.setdefault("Content-Type", f"text/plain; charset={response.charset}")
             response.text = STATUS_CODES[405]
             return response
 
@@ -260,41 +360,134 @@ def wrap_view_method_guard(view_callable, allowed_methods):
     return guarded
 
 
+def require_schema(schema):
+    """
+    Декоратор view: validate_payload(request.get_form(), schema).
+    При ошибках — 400 и текст с перечислением полей.
+    """
+    def decorator(fn):
+        def guarded(request, response, **kwargs):
+            errs = validate_payload(request.get_form(), schema)
+            if errs:
+                response.status_code = 400
+                response.headers.setdefault("Content-Type", f"text/plain; charset={response.charset}")
+                response.text = "; ".join(errs)
+                return response
+            return fn(request, response, **kwargs)
+
+        return guarded
+
+    return decorator
+
+
 # **********************************************************************
-# *********************** Project settings template ********************
+# *********************** Project settings package *********************
 # **********************************************************************
-settings_template = (
-    "import os\n\n\n"
-    "PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))\n\n"
-    "DEBUG = True\n\n"
-    "SECRET_KEY = os.environ.get('STONECRAB_SECRET_KEY', 'change-me-in-production')\n\n"
-    "SESSION_COOKIE_NAME = 'stonecrab_sid'\n"
-    "CSRF_HEADER_NAME = 'X-CSRF-Token'\n"
-    "AUTH_SESSION_KEY = 'auth_user_id'\n\n"
-    "MEDIA_URL = '/media/'\n\n"
-    "MEDIA_DIR = os.path.join(PROJECT_DIR, 'media')\n\n"
-    "STATIC_URL = '/static/'\n\n"
-    "STATIC_DIR = os.path.join(PROJECT_DIR, 'static')\n\n"
-    "TEMPLATE_DIRS = os.path.join(PROJECT_DIR, 'templates')\n\n"
-    "MIDDLEWARE = [\n"
-    "    'SecurityMiddleware',\n"
-    "    'AuthenticationMiddleware',\n"
-    "    'CsrfMiddleware',\n"
-    "    'SessionMiddleware',\n"
-    "    'StaticfilesMiddleware',\n"
-    "    'GzipMiddleware',\n"
-    "    'LogMiddleware',\n"
-    "    'MessageMiddleware',\n"
-    "    'CleanHTMLMiddleware',\n]\n"
-)
+SETTINGS_INIT_PY = """# -*- coding: utf-8 -*-
+import os
+
+_env = os.environ.get("STONECRAB_ENV", "development").lower()
+if _env == "production":
+    from .production import *  # noqa: F401,F403
+else:
+    from .development import *  # noqa: F401,F403
+"""
+
+SETTINGS_BASE_PY = '''# -*- coding: utf-8 -*-
+"""Общие настройки (пути, middleware, лимиты). Окружение — development / production."""
+import os
+
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+SECRET_KEY = os.environ.get("STONECRAB_SECRET_KEY", "change-me-in-production")
+
+SESSION_COOKIE_NAME = "stonecrab_sid"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+AUTH_SESSION_KEY = "auth_user_id"
+SESSION_COOKIE_SECURE = None
+SESSION_COOKIE_SAMESITE = "Lax"
+
+MEDIA_URL = "/media/"
+MEDIA_DIR = os.path.join(PROJECT_DIR, "media")
+STATIC_URL = "/static/"
+STATIC_DIR = os.path.join(PROJECT_DIR, "static")
+TEMPLATE_DIRS = os.path.join(PROJECT_DIR, "templates")
+
+MAX_REQUEST_BODY_BYTES = 10_000_000
+MAX_HTTP_HEADERS = 80
+CORS_ORIGINS = []
+API_PATH_PREFIXES = ("/api",)
+HSTS_MAX_AGE = 31536000
+HSTS_INCLUDE_SUBDOMAINS = False
+SENSITIVE_CACHE_PATH_PREFIXES = ("/api", "/admin")
+HEALTH_PATH = "/health"
+OPENAPI_PATH = "/openapi.json"
+API_VERSION_PREFIX = ""
+RESPONSE_CACHE_TTL = 0
+IDEMPOTENCY_TTL = 3600
+BEFORE_REQUEST_HOOKS = []
+AFTER_REQUEST_HOOKS = []
+
+# Порядок: внешний слой первым (ближе к клиенту).
+MIDDLEWARE = [
+    "TrustedHostMiddleware",
+    "RequestLimitsMiddleware",
+    "RateLimitMiddleware",
+    "CorsMiddleware",
+    "ApiOriginMiddleware",
+    "MetricsMiddleware",
+    "SecurityMiddleware",
+    "HstsMiddleware",
+    "SensitiveCacheMiddleware",
+    "AuthenticationMiddleware",
+    "ApiVersionPrefixMiddleware",
+    "CsrfMiddleware",
+    "SessionMiddleware",
+    "IdempotencyMiddleware",
+    "ResponseCacheMiddleware",
+    "StaticfilesMiddleware",
+    "GzipMiddleware",
+    "LogMiddleware",
+    "RequestHooksMiddleware",
+    "MessageMiddleware",
+    "CleanHTMLMiddleware",
+]
+'''
+
+SETTINGS_DEVELOPMENT_PY = '''# -*- coding: utf-8 -*-
+from .base import *  # noqa: F401,F403
+
+DEBUG = True
+ALLOWED_HOSTS = ["*"]
+RATE_LIMIT_PER_MINUTE = 0
+API_ENFORCE_ORIGIN = False
+'''
+
+SETTINGS_PRODUCTION_PY = '''# -*- coding: utf-8 -*-
+import os
+from .base import *  # noqa: F401,F403
+
+DEBUG = False
+
+_raw_hosts = os.environ.get("ALLOWED_HOSTS", "").strip()
+ALLOWED_HOSTS = [h.strip() for h in _raw_hosts.split(",") if h.strip()]
+if not ALLOWED_HOSTS:
+    raise RuntimeError("ALLOWED_HOSTS не задан. Пример: export ALLOWED_HOSTS=example.com,www.example.com")
+
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "120"))
+SESSION_COOKIE_SECURE = True
+API_ENFORCE_ORIGIN = os.environ.get("API_ENFORCE_ORIGIN", "1") not in ("0", "false", "False")
+
+_cors = os.environ.get("CORS_ORIGINS", "").strip()
+CORS_ORIGINS = [x.strip() for x in _cors.split(",") if x.strip()] if _cors else []
+'''
 
 
 routes_template = (
     "# -*- coding: utf-8 -*-\n"
     "from . import views\n\n"
     "urls = {}\n"
-    "# Явные пары путь -> обработчик; маршруты с @route в views подключаются автоматически.\n"
-)
+    "# Явные пары путь -> обработчик; маршруты с @route в views подключаются автоматически.\n")
 
 
 views_template = (
@@ -305,8 +498,7 @@ views_template = (
     '        "title": "Stonecrab",\n'
     '        "welcom": "Welcom",\n'
     "    }\n"
-    '    return render("index.html", context, version="v.0.1")\n'
-)
+    '    return render("index.html", context, version="v.0.1")\n')
 
 
 # **********************************************************************
@@ -319,7 +511,6 @@ class Messages:
     Notes:
         Методы вызываются как Messages.method(...) без экземпляра.
     """
-
     def out_allowed(text):
         """Печатает сообщение категории «разрешено»."""
         print(f"\033[36m✅ [ALLOWED]: \033[33m{text}\033[0m")
@@ -361,28 +552,22 @@ class Messages:
 
     def error_bad_request(request, response, **kwargs):
         """Логирует ответ с кодом 400 Bad Request."""
-        Messages.out_error(
-            f"🚫 [{request.method}] CODE:400 \"{request.path}\" {STATUS_CODES[400]}"
-        )
+        Messages.out_error(f"🚫 [{request.method}] CODE:400 '{request.path}' {STATUS_CODES[400]}")
 
     def error_prefix(app="", prefix=""):
         """Сообщает об ошибке чтения префикса URL приложения."""
-        Messages.out_error(
-            f"🔗 Ошибка URL-префикса >>> \"{prefix}\" <<< для приложения >>> \"{app}\" <<<"
-        )
+        Messages.out_error(f"🔗 Ошибка URL-префикса >>> '{prefix}' <<< для приложения >>> '{app}' <<<")
 
     def error_response(request, response):
         """Логирует ответ с кодом ошибки по фактическому status_code."""
         path = request.path.rstrip("/")
         code = int(response.status_code)
         phrase = STATUS_CODES.get(code, f"HTTP {code}")
-        Messages.out_error(f"📛 [{request.method}] CODE:{code} \"{path}\" {phrase}")
+        Messages.out_error(f"📛 [{request.method}] CODE:{code} '{path}' {phrase}")
 
     def error_method_not_detected(request):
         """Сообщает, что для маршрута не найден обработчик HTTP-метода."""
-        Messages.out_error(
-            f"🛤️ Метод \"{request.method}\" для \"{request.path}\" не найден"
-        )
+        Messages.out_error(f"🛤️ Метод '{request.method}' для '{request.path}' не найден")
 
     def error_no_found_apps_folder():
         """Сообщает об отсутствии каталога apps."""
@@ -394,7 +579,7 @@ class Messages:
 
     def error_route_already_exists(path):
         """Сообщает о дублировании маршрута при регистрации."""
-        Messages.out_error(f"⛔ Маршрут \"{path}\" уже зарегистрирован")
+        Messages.out_error(f"⛔ Маршрут '{path}' уже зарегистрирован")
 
     def error_unknown_parameter():
         """Сообщает о неизвестной подкоманде CLI."""
@@ -417,7 +602,7 @@ class Messages:
         path = request.path.rstrip("/")
         code = int(response.status_code)
         phrase = STATUS_CODES.get(code, f"HTTP {code}")
-        Messages.out_info(f"🌐 [{request.method}] CODE:{code} \"{path}\" {phrase}")
+        Messages.out_info(f"🌐 [{request.method}] CODE:{code} '{path}' {phrase}")
 
     def info_upd_app(name):
         """Сообщает об обновлении приложения (например, при startproject)."""
@@ -426,37 +611,32 @@ class Messages:
     def warning_spaces_url_prefix(app=""):
         """Предупреждает о пробелах в URL_PREFIX."""
         Messages.out_warning(
-            f"🔤 Приложение >>> \"{app}\" <<< — в URL_PREFIX пробелы, "
-            f"будет использовано имя приложения"
-        )
+            f"🔤 Приложение >>> '{app}' <<< — в URL_PREFIX пробелы, "
+            f"будет использовано имя приложения")
 
     def warning_slash_url_prefix(app=""):
         """Предупреждает о URL_PREFIX, равном одному слешу."""
         Messages.out_warning(
-            f"➗ Приложение >>> \"{app}\" <<< — URL_PREFIX равен одному слешу, "
-            f"будет использовано имя приложения"
-        )
+            f"➗ Приложение >>> '{app}' <<< — URL_PREFIX равен одному слешу, "
+            f"будет использовано имя приложения")
 
     def warning_empty_url_prefix(app=""):
         """Предупреждает о пустом URL_PREFIX."""
         Messages.out_warning(
-            f"📭 Приложение >>> \"{app}\" <<< — пустой URL_PREFIX, "
-            f"будет использовано имя приложения"
-        )
+            f"📭 Приложение >>> '{app}' <<< — пустой URL_PREFIX, "
+            f"будет использовано имя приложения")
 
     def warning_none_url_prefix(app=""):
         """Предупреждает о URL_PREFIX со значением None."""
         Messages.out_warning(
-            f"∅ Приложение >>> \"{app}\" <<< — URL_PREFIX равен None, "
-            f"будет использовано имя приложения"
-        )
+            f"∅ Приложение >>> '{app}' <<< — URL_PREFIX равен None, "
+            f"будет использовано имя приложения")
 
     def warning_no_url_prefix(app=""):
         """Предупреждает об отсутствии атрибута URL_PREFIX в routes."""
         Messages.out_warning(
-            f"📋 Приложение >>> \"{app}\" <<< — нет атрибута URL_PREFIX в routes, "
-            f"будет использовано имя приложения"
-        )
+            f"📋 Приложение >>> '{app}' <<< — нет атрибута URL_PREFIX в routes, "
+            f"будет использовано имя приложения")
 
 
 # **********************************************************************
@@ -469,7 +649,6 @@ class Utilities:
     Notes:
         Вложенные классы группируют статические методы по назначению.
     """
-
     class FileSystem:
         """Работа с файловой системой."""
 
@@ -508,6 +687,113 @@ class Utilities:
             stat = os.stat(file_path)
             return f'"{stat.st_mtime_ns}-{stat.st_size}"'
 
+    class Network:
+        """
+        Удобные обёртки для оборудования и серверов на чистом stdlib.
+
+        Есть: TCP/UDP (socket), TLS (ssl), FTP (ftplib), HTTP-клиент (urllib),
+        SMTP (smtplib), грубая проверка ICMP через системный ping (subprocess).
+        Нет в stdlib: SSH/SFTP, SNMP, Telnet-клиент (3.13+), переносимый raw ICMP —
+        используйте PyPI (Paramiko, pysnmp и т.д.) или вызов внешних утилит.
+        """
+
+        @staticmethod
+        def tcp_connect(host, port, timeout=10.0):
+            return socket.create_connection((host, int(port)), timeout=timeout)
+
+        @staticmethod
+        def tcp_exchange(host, port, send=b"", recv_max=65536, timeout=10.0):
+            with socket.create_connection((host, int(port)), timeout=timeout) as s:
+                if send:
+                    s.sendall(send)
+                return s.recv(recv_max)
+
+        @staticmethod
+        def udp_send_recv(host, port, payload, recv_max=65536, timeout=5.0):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(timeout)
+                s.sendto(payload, (host, int(port)))
+                try:
+                    data, addr = s.recvfrom(recv_max)
+                    return data, addr
+                except socket.timeout:
+                    return None, None
+
+        @staticmethod
+        def tls_connect(host, port, timeout=10.0, context=None):
+            ctx = context or ssl.create_default_context()
+            raw = socket.create_connection((host, int(port)), timeout=timeout)
+            try:
+                return ctx.wrap_socket(raw, server_hostname=host)
+            except Exception:
+                raw.close()
+                raise
+
+        @staticmethod
+        @contextlib.contextmanager
+        def ftp_session(host, user="", passwd="", timeout=30, passive=True):
+            ftp = ftplib.FTP()
+            ftp.connect(host, timeout=timeout)
+            ftp.login(user, passwd)
+            if passive:
+                ftp.set_pasv(True)
+            try:
+                yield ftp
+            finally:
+                try:
+                    ftp.quit()
+                except Exception:
+                    ftp.close()
+
+        @staticmethod
+        def http_request(url, method="GET", data=None, headers=None, timeout=30):
+            m = method.upper()
+            req = urllib.request.Request(url, data=data, method=m)
+            if headers:
+                for hk, hv in headers.items():
+                    req.add_header(hk, hv)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+                return body, resp.status, dict(resp.headers)
+
+        @staticmethod
+        def smtp_send(
+            host,
+            port,
+            from_addr,
+            to_addrs,
+            message,
+            user=None,
+            password=None,
+            use_tls=True,):
+            if isinstance(to_addrs, str):
+                to_addrs = [to_addrs]
+            with smtplib.SMTP(host, int(port), timeout=30) as smtp:
+                if use_tls:
+                    smtp.starttls(context=ssl.create_default_context())
+                if user is not None and password is not None:
+                    smtp.login(user, password)
+                smtp.sendmail(from_addr, to_addrs, message)
+
+        @staticmethod
+        def ping_host(host, timeout_sec=5):
+            """
+            Запуск системного ping; на Windows и Unix флаги различаются.
+            Возвращает (успех: bool, объединённый вывод stdout/stderr).
+            """
+            system = platform.system().lower()
+            if system == "windows":
+                cmd = [
+                    "ping", "-n", "1", "-w", str(max(1, int(timeout_sec * 1000))), host]
+            else:
+                cmd = ["ping", "-c", "1", host]
+            try:
+                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=float(timeout_sec) + 3.0)
+                out = (cp.stdout or "") + (cp.stderr or "")
+                return cp.returncode == 0, out
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                return False, str(exc)
+
     class URL:
         """Вспомогательные утилиты для работы с URL."""
 
@@ -528,9 +814,7 @@ class Utilities:
                 prefix = ""
             else:
                 try:
-                    module_prefix = __import__(
-                        f"apps.{app}.routes", fromlist=["object"]
-                    )
+                    module_prefix = __import__(f"apps.{app}.routes", fromlist=["object"])
                     prefix = f"{module_prefix.URL_PREFIX}".lower().rstrip("/")
 
                     if prefix == "/":
@@ -697,8 +981,7 @@ class Utilities:
             "Ґ": "g",
             "Ї": "i",
             "Є": "e",
-            "—": "",
-        }
+            "—": ""}
         for key in dictionary:
             string = string.replace(key, dictionary[key])
         return string
@@ -720,11 +1003,7 @@ class Utilities:
         apps_root = Path(settings.PROJECT_DIR) / "apps"
         if not apps_root.is_dir():
             return []
-        return sorted(
-            p.name
-            for p in apps_root.iterdir()
-            if p.is_dir() and p.name != "__pycache__"
-        )
+        return sorted(p.name for p in apps_root.iterdir() if p.is_dir() and p.name != "__pycache__")
 
     def get_content_length(file_path):
         """Возвращает размер файла в байтах строкой (для заголовка Content-Length)."""
@@ -770,28 +1049,15 @@ class Utilities:
             Не использует strftime, чтобы не зависеть от локали для имён дней и месяцев.
         """
         t = dt.utctimetuple()
+        _m = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
         return "%s, %02d %s %04d %02d:%02d:%02d GMT" % (
             ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[t[6]],
             t[2],
-            (
-                "Jan",
-                "Feb",
-                "Mar",
-                "Apr",
-                "May",
-                "Jun",
-                "Jul",
-                "Aug",
-                "Sep",
-                "Oct",
-                "Nov",
-                "Dec",
-            )[t[1] - 1],
+            _m[t[1] - 1],
             t[0],
             t[3],
             t[4],
-            t[5],
-        )
+            t[5])
 
 
 # **********************************************************************
@@ -807,8 +1073,7 @@ class EMail:
         password="",
         subject="",
         to="",
-        message="",
-    ):
+        message="",):
         self._server = server
         self._login = login
         self._password = password
@@ -842,15 +1107,12 @@ class Request(object):
         Поля session, csrf_token, user_id и флаг csrf_failed заполняются
         middleware после разбора тела запроса.
     """
-
     def __init__(self, environ):
         self.environ = environ
         self.method = environ.get("REQUEST_METHOD", "GET").upper()
         self.path = (environ.get("PATH_INFO") or "/").strip() or "/"
         raw_ct = environ.get("CONTENT_TYPE") or ""
-        self.content_type, self.charset = Utilities.parse_content_type(
-            raw_ct or "application/octet-stream"
-        )
+        self.content_type, self.charset = Utilities.parse_content_type(raw_ct or "application/octet-stream")
         self.headers = self.get_headers()
         self.context = {}
         self.args = {}
@@ -867,9 +1129,7 @@ class Request(object):
 
         qs = environ.get("QUERY_STRING", "") or ""
         self.raw_query_string = qs
-        self.GET = flatten_parse_result(
-            urllib.parse.parse_qs(qs, keep_blank_values=True)
-        )
+        self.GET = flatten_parse_result(urllib.parse.parse_qs(qs, keep_blank_values=True))
 
         self.POST = {}
         self.FILES = {}
@@ -881,9 +1141,7 @@ class Request(object):
                     decoded = self.body.decode(self.charset, errors="replace")
                 except LookupError:
                     decoded = self.body.decode("utf-8", errors="replace")
-                self.POST = flatten_parse_result(
-                    urllib.parse.parse_qs(decoded, keep_blank_values=True)
-                )
+                self.POST = flatten_parse_result(urllib.parse.parse_qs(decoded, keep_blank_values=True))
             elif ct_main == "multipart/form-data":
                 boundary = ""
                 for part in raw_ct.split(";")[1:]:
@@ -891,9 +1149,7 @@ class Request(object):
                     if part.lower().startswith("boundary="):
                         boundary = part.partition("=")[2].strip().strip('"')
                         break
-                self.POST, self.FILES = parse_multipart_body(
-                    self.body, boundary, self.charset
-                )
+                self.POST, self.FILES = parse_multipart_body(self.body, boundary, self.charset)
 
         self.session = {}
         self.session_id = None
@@ -958,13 +1214,10 @@ class Response(object):
         Заголовки хранятся в виде словаря str -> str; несколько
         значений Set-Cookie задаются через словарь cookies.
     """
-
     def __init__(self):
         self.charset = "utf-8"
         self.cookies = {}
-        self.headers = {
-            "Content-Type": "text/html; charset=utf-8",
-        }
+        self.headers = {"Content-Type": "text/html; charset=utf-8"}
         self.status_code = 200
         self.text = ""
         self.body = b""
@@ -989,11 +1242,7 @@ class Response(object):
         """
         self.is_redirect = True
         self.status_code = int(status_code)
-        self.headers = {
-            "Content-Type": f"text/html; charset={self.charset}",
-            "Location": url,
-            "Content-Length": "0",
-        }
+        self.headers = {"Content-Type": f"text/html; charset={self.charset}", "Location": url, "Content-Length": "0"}
         self.text = ""
         self.body = b""
         self.stream = None
@@ -1009,7 +1258,15 @@ class Response(object):
         for key, val in self.headers.items():
             hdr_list.append((key, str(val)))
         for name, val in self.cookies.items():
-            hdr_list.append(("Set-Cookie", build_set_cookie_value(name, val)))
+            if isinstance(val, dict):
+                v = val.get("value", "")
+                opts = {
+                    k: w
+                    for k, w in val.items()
+                    if k != "value"}
+                hdr_list.append(("Set-Cookie", build_set_cookie_value(name, v, **opts)))
+            else:
+                hdr_list.append(("Set-Cookie", build_set_cookie_value(name, val)))
         return hdr_list
 
     def wsgi_body_iter(self):
@@ -1024,8 +1281,7 @@ class Response(object):
         if (
             self.body is not None
             and hasattr(self.body, "__iter__")
-            and not isinstance(self.body, (str, bytes, bytearray))
-        ):
+            and not isinstance(self.body, (str, bytes, bytearray))):
             return self.body
         return iter([b""])
 
@@ -1040,7 +1296,6 @@ class Middleware:
     Notes:
         Внешний экземпляр вызывает dispatch_request у вложенного приложения.
     """
-
     def __init__(self, app):
         self.app = app
 
@@ -1076,9 +1331,307 @@ class Middleware:
         return response
 
 
+class TrustedHostMiddleware(Middleware):
+    """Проверка HTTP Host по ALLOWED_HOSTS (для прода задайте явный список)."""
+    def __call__(self, environ, start_response):
+        allowed = getattr(settings, "ALLOWED_HOSTS", ["*"])
+        if allowed not in (["*"], ("*",)):
+            host = (environ.get("HTTP_HOST") or "").split(":")[0].strip().lower()
+            ok = any(h.strip().lower() == host for h in allowed)
+            if not ok:
+                r = Response()
+                r.status_code = 400
+                r.headers["Content-Type"] = "text/plain; charset=utf-8"
+                r.text = "Invalid Host header"
+                start_response(r.wsgi_status(), r.wsgi_headers())
+                return iter([r.text.encode(r.charset)])
+
+        return Middleware.__call__(self, environ, start_response)
+
+
+class RequestLimitsMiddleware(Middleware):
+    """Лимит размера тела (CONTENT_LENGTH) и числа заголовков запроса."""
+    def __call__(self, environ, start_response):
+        try:
+            cl = int(environ.get("CONTENT_LENGTH") or 0)
+        except (TypeError, ValueError):
+            cl = 0
+
+        max_b = int(getattr(settings, "MAX_REQUEST_BODY_BYTES", 10_000_000))
+        if cl > max_b:
+            r = Response()
+            r.status_code = 413
+            r.headers["Content-Type"] = "text/plain; charset=utf-8"
+            r.text = STATUS_CODES[413]
+            start_response(r.wsgi_status(), r.wsgi_headers())
+            return iter([b""])
+
+        max_h = int(getattr(settings, "MAX_HTTP_HEADERS", 80))
+        n = sum(1 for k in environ if k.startswith("HTTP_") or k in ("CONTENT_LENGTH", "CONTENT_TYPE"))
+        if n > max_h:
+            r = Response()
+            r.status_code = 400
+            r.headers["Content-Type"] = "text/plain; charset=utf-8"
+            r.text = "Too many headers"
+            start_response(r.wsgi_status(), r.wsgi_headers())
+            return iter([b""])
+
+        return Middleware.__call__(self, environ, start_response)
+
+
+class RateLimitMiddleware(Middleware):
+    """In-process лимит запросов в минуту на REMOTE_ADDR (0 = выкл.)."""
+    def __call__(self, environ, start_response):
+        lim = int(getattr(settings, "RATE_LIMIT_PER_MINUTE", 0) or 0)
+        if lim <= 0:
+            return Middleware.__call__(self, environ, start_response)
+
+        ip = environ.get("REMOTE_ADDR") or "unknown"
+        now = time.time()
+        window = 60.0
+
+        with _CACHE_LOCK:
+            bucket = _RATE_BUCKET.setdefault(ip, [])
+            bucket[:] = [t for t in bucket if now - t < window]
+            if len(bucket) >= lim:
+                r = Response()
+                r.status_code = 429
+                r.headers["Content-Type"] = "text/plain; charset=utf-8"
+                r.text = STATUS_CODES[429]
+                start_response(r.wsgi_status(), r.wsgi_headers())
+                return iter([b""])
+            bucket.append(now)
+
+        return Middleware.__call__(self, environ, start_response)
+
+
+class CorsMiddleware(Middleware):
+    """CORS: ответ OPTIONS и заголовки по CORS_ORIGINS (пусто = выкл.)."""
+    def _apply_cors(self, request, response, origins):
+        origin = request.environ.get("HTTP_ORIGIN", "")
+        if "*" in origins:
+            allow = "*"
+        elif origin and origin in origins:
+            allow = origin
+        elif origins:
+            allow = origins[0]
+        else:
+            return
+
+        response.headers["Access-Control-Allow-Origin"] = allow
+        response.headers.setdefault(
+            "Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+        req_hdr = request.environ.get("HTTP_ACCESS_CONTROL_REQUEST_HEADERS", "*")
+        response.headers.setdefault("Access-Control-Allow-Headers", req_hdr or "*")
+        response.headers.setdefault("Access-Control-Max-Age", "86400")
+
+    def process_response(self, request, response):
+        origins = list(getattr(settings, "CORS_ORIGINS", None) or [])
+        if origins:
+            self._apply_cors(request, response, origins)
+
+    def dispatch_request(self, request):
+        origins = list(getattr(settings, "CORS_ORIGINS", None) or [])
+        if not origins:
+            return Middleware.dispatch_request(self, request)
+
+        if (
+            request.method == "OPTIONS"
+            and request.environ.get("HTTP_ACCESS_CONTROL_REQUEST_METHOD")):
+            self.process_request(request)
+            r = Response()
+            r.status_code = 204
+            r.headers["Content-Type"] = "text/plain; charset=utf-8"
+            self.process_response(request, r)
+            return r
+
+        return Middleware.dispatch_request(self, request)
+
+
+class ApiOriginMiddleware(Middleware):
+    """Для API-префиксов: при API_ENFORCE_ORIGIN требует Origin из CORS_ORIGINS."""
+    def dispatch_request(self, request):
+        if not getattr(settings, "API_ENFORCE_ORIGIN", False):
+            return Middleware.dispatch_request(self, request)
+
+        path = request.path or ""
+        prefs = getattr(settings, "API_PATH_PREFIXES", ("/api",))
+        if not any(path.startswith(p) for p in prefs):
+            return Middleware.dispatch_request(self, request)
+
+        if request.method in CSRF_SAFE_METHODS:
+            return Middleware.dispatch_request(self, request)
+
+        allowed = list(getattr(settings, "CORS_ORIGINS", None) or [])
+        origin = request.environ.get("HTTP_ORIGIN", "")
+        ref = request.environ.get("HTTP_REFERER", "")
+        ok = False
+        if origin and origin in allowed:
+            ok = True
+        elif ref and allowed:
+            ok = any(ref.startswith(a + "/") or ref.rstrip("/") == a for a in allowed)
+
+        if not ok:
+            self.process_request(request)
+            r = Response()
+            r.status_code = 403
+            r.headers["Content-Type"] = "text/plain; charset=utf-8"
+            r.text = "Origin/Referer not allowed"
+            self.process_response(request, r)
+            return r
+
+        return Middleware.dispatch_request(self, request)
+
+
+class MetricsMiddleware(Middleware):
+    """Добавляет X-Response-Time-Ms (время обработки внутри цепочки под этим слоем)."""
+    def dispatch_request(self, request):
+        t0 = time.perf_counter()
+        response = Middleware.dispatch_request(self, request)
+        ms = (time.perf_counter() - t0) * 1000.0
+        response.headers.setdefault("X-Response-Time-Ms", f"{ms:.3f}")
+        return response
+
+
+class HstsMiddleware(Middleware):
+    """Strict-Transport-Security только при HTTPS (wsgi.url_scheme)."""
+    def process_response(self, request, response):
+        if request.environ.get("wsgi.url_scheme") != "https":
+            return
+
+        age = int(getattr(settings, "HSTS_MAX_AGE", 31536000))
+        val = f"max-age={age}"
+        if getattr(settings, "HSTS_INCLUDE_SUBDOMAINS", False):
+            val += "; includeSubDomains"
+        response.headers.setdefault("Strict-Transport-Security", val)
+
+
+class SensitiveCacheMiddleware(Middleware):
+    """Cache-Control: no-store для ошибок, чувствительных путей и авторизованных."""
+    def process_response(self, request, response):
+        path = request.path or ""
+        prefs = getattr(settings, "SENSITIVE_CACHE_PATH_PREFIXES", ("/api",))
+        code = int(response.status_code)
+
+        if (
+            code >= 400
+            or getattr(request, "user_id", None) is not None
+            or any(path.startswith(p) for p in prefs)):
+            response.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate")
+
+
+class ApiVersionPrefixMiddleware(Middleware):
+    """Срезает API_VERSION_PREFIX с начала path (версионирование в URL)."""
+    def process_request(self, request):
+        prefix = getattr(settings, "API_VERSION_PREFIX", "") or ""
+        if not prefix or not request.path.startswith(prefix):
+            return
+
+        rest = request.path[len(prefix) :].lstrip("/")
+        request.path = "/" + rest if rest else "/"
+
+
+class IdempotencyMiddleware(Middleware):
+    """Кэш ответа POST по заголовку Idempotency-Key (in-process, IDEMPOTENCY_TTL)."""
+    def dispatch_request(self, request):
+        if request.method != "POST":
+            return Middleware.dispatch_request(self, request)
+
+        key = (request.environ.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
+        if not key:
+            return Middleware.dispatch_request(self, request)
+
+        ttl = int(getattr(settings, "IDEMPOTENCY_TTL", 3600))
+        ck = f"POST|{request.path}|{key}"
+        now = time.time()
+
+        with _CACHE_LOCK:
+            ent = _IDEMPOTENCY_CACHE.get(ck)
+            if ent and ent[0] > now:
+                self.process_request(request)
+                _, status, hdrs, text = ent
+                r = Response()
+                r.status_code = status
+                r.headers.update(hdrs)
+                r.text = text
+                self.process_response(request, r)
+                return r
+
+        request._idempotency_ck = ck
+        request._idempotency_ttl = ttl
+        return Middleware.dispatch_request(self, request)
+
+    def process_response(self, request, response):
+        ck = getattr(request, "_idempotency_ck", None)
+        if not ck:
+            return
+
+        if int(response.status_code) >= 500:
+            return
+
+        with _CACHE_LOCK:
+            _IDEMPOTENCY_CACHE[ck] = (
+                time.time() + request._idempotency_ttl,
+                int(response.status_code),
+                dict(response.headers),
+                response.text)
+
+
+class ResponseCacheMiddleware(Middleware):
+    """Простой кэш GET-ответов (RESPONSE_CACHE_TTL секунд, 0 = выкл.)."""
+    def dispatch_request(self, request):
+        ttl = int(getattr(settings, "RESPONSE_CACHE_TTL", 0) or 0)
+        ck = None
+        now = time.time()
+
+        if ttl > 0 and request.method == "GET":
+            ck = f"{request.path}?{request.environ.get('QUERY_STRING', '')}"
+            with _CACHE_LOCK:
+                ent = _RESPONSE_CACHE.get(ck)
+                if ent and ent[0] > now:
+                    self.process_request(request)
+                    _, status, hdrs, text = ent
+                    r = Response()
+                    r.status_code = status
+                    r.headers.update(hdrs)
+                    r.text = text
+                    self.process_response(request, r)
+                    return r
+
+        response = Middleware.dispatch_request(self, request)
+
+        if (
+            ttl > 0
+            and ck
+            and request.method == "GET"
+            and int(response.status_code) == 200
+            and response.stream is None):
+            with _CACHE_LOCK:
+                _RESPONSE_CACHE[ck] = (
+                    time.time() + ttl,
+                    int(response.status_code),
+                    dict(response.headers),
+                    response.text)
+
+        return response
+
+
+class RequestHooksMiddleware(Middleware):
+    """Хуки BEFORE_REQUEST_HOOKS(request) и AFTER_REQUEST_HOOKS(request, response)."""
+    def dispatch_request(self, request):
+        for hook in getattr(settings, "BEFORE_REQUEST_HOOKS", None) or []:
+            hook(request)
+
+        response = self.app.dispatch_request(request)
+
+        for hook in getattr(settings, "AFTER_REQUEST_HOOKS", None) or []:
+            hook(request, response)
+
+        return response
+
+
 class AuthenticationMiddleware(Middleware):
     """Читает идентификатор пользователя из сессии (ключ AUTH_SESSION_KEY)."""
-
     def process_request(self, request):
         key = getattr(settings, "AUTH_SESSION_KEY", "auth_user_id")
         uid = request.session.get(key)
@@ -1122,20 +1675,19 @@ class CsrfMiddleware(Middleware):
         sent = (
             request.POST.get("csrf_token")
             or request.POST.get("csrfmiddlewaretoken")
-            or request.environ.get(env_key, "")
-        )
+            or request.environ.get(env_key, ""))
 
         if not sent or len(str(sent)) != len(str(request.csrf_token)):
             request.csrf_failed = True
             return
 
         if not hmac.compare_digest(
-            str(sent).encode("utf-8"), str(request.csrf_token).encode("utf-8")
-        ):
+            str(sent).encode("utf-8"), str(request.csrf_token).encode("utf-8")):
             request.csrf_failed = True
 
     def dispatch_request(self, request):
         self.process_request(request)
+
         if getattr(request, "csrf_failed", False):
             response = Response()
             response.status_code = 403
@@ -1143,6 +1695,7 @@ class CsrfMiddleware(Middleware):
             response.text = "CSRF verification failed"
             self.process_response(request, response)
             return response
+
         response = self.app.dispatch_request(request)
         self.process_response(request, response)
         return response
@@ -1164,16 +1717,17 @@ class GzipMiddleware(Middleware):
 
 
 class LogMiddleware(Middleware):
-    """Зарезервировано: расширенное логирование запросов и ответов."""
-
+    """Структурный лог запроса/ответа в stderr (log_event)."""
     def __init__(self, app):
         super().__init__(app)
 
-    def process_request(self, request):
-        pass
-
     def process_response(self, request, response):
-        pass
+        log_event(
+            "http_access",
+            method=request.method,
+            path=request.path,
+            status=int(response.status_code),
+            remote_addr=request.environ.get("REMOTE_ADDR"))
 
 
 class MessageMiddleware(Middleware):
@@ -1193,9 +1747,7 @@ class MessageMiddleware(Middleware):
             response.text = render("errors/500.html")
         elif code == 501:
             Messages.error_response(request, response)
-            response.text = render(
-                "errors/501.html", method=f"{request.method.upper()}"
-            )
+            response.text = render("errors/501.html", method=f"{request.method.upper()}")
 
 
 class SecurityMiddleware(Middleware):
@@ -1204,16 +1756,11 @@ class SecurityMiddleware(Middleware):
     def process_response(self, request, response):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault(
-            "Referrer-Policy", "strict-origin-when-cross-origin"
-        )
-        response.headers.setdefault(
-            "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
-        )
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
-        )
+            "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
         response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
 
@@ -1225,7 +1772,6 @@ class SessionMiddleware(Middleware):
     Notes:
         Хранилище не разделяется между отдельными worker-процессами WSGI.
     """
-
     def process_request(self, request):
         name = getattr(settings, "SESSION_COOKIE_NAME", "stonecrab_sid")
         sid = request.get_cookies().get(name)
@@ -1243,7 +1789,16 @@ class SessionMiddleware(Middleware):
     def process_response(self, request, response):
         if getattr(request, "session_is_new", False):
             name = getattr(settings, "SESSION_COOKIE_NAME", "stonecrab_sid")
-            response.cookies[name] = request.session_id
+            sec = getattr(settings, "SESSION_COOKIE_SECURE", None)
+            if sec is None:
+                sec = request.environ.get("wsgi.url_scheme") == "https"
+            samesite = getattr(settings, "SESSION_COOKIE_SAMESITE", "Lax")
+            response.cookies[name] = {
+                "value": request.session_id,
+                "secure": bool(sec),
+                "samesite": samesite,
+                "httponly": True,
+                "path": "/"}
 
 
 class StaticfilesMiddleware(Middleware):
@@ -1306,9 +1861,7 @@ class StaticfilesMiddleware(Middleware):
         response.stream = None
         response.headers["Accept-Ranges"] = "bytes"
         response.headers["Content-Length"] = Utilities.get_content_length(file_path)
-        response.headers["Last-Modified"] = Utilities.HTTP.generate_last_modified(
-            file_path
-        )
+        response.headers["Last-Modified"] = Utilities.HTTP.generate_last_modified(file_path)
         etag = Utilities.HTTP.get_etag(file_path)
         response.headers["ETag"] = etag
 
@@ -1367,13 +1920,12 @@ class StoneCrab:
     Notes:
         Экземпляр вызывается сервером как application(environ, start_response).
     """
-
     def __init__(self):
         self.apps_list = Utilities.get_apps()
         self.middleware = Middleware(self)
         self.routes = self.register_apps_routes()
         self.session = None
-        for item in settings.MIDDLEWARE:
+        for item in reversed(settings.MIDDLEWARE):
             get_class = lambda x: globals()[x]
             c = get_class(item)
             self.middleware.add(c)
@@ -1399,9 +1951,7 @@ class StoneCrab:
             response: Экземпляр Response.
         """
         response.status_code = 404
-        response.headers.setdefault(
-            "Content-Type", f"text/plain; charset={response.charset}"
-        )
+        response.headers.setdefault("Content-Type", f"text/plain; charset={response.charset}")
         response.text = STATUS_CODES[404]
 
     def dispatch_request(self, request):
@@ -1414,6 +1964,21 @@ class StoneCrab:
         Returns:
             Сформированный Response.
         """
+        hp = getattr(settings, "HEALTH_PATH", "/health")
+        op = getattr(settings, "OPENAPI_PATH", "/openapi.json")
+
+        if request.path == hp:
+            r = Response()
+            r.headers["Content-Type"] = "application/json; charset=utf-8"
+            r.text = json.dumps({"status": "ok"})
+            return r
+
+        if request.path == op:
+            r = Response()
+            r.headers["Content-Type"] = "application/json; charset=utf-8"
+            r.text = json.dumps(build_openapi_spec(self.routes))
+            return r
+
         response = Response()
         handler, kwargs = self.find_handler(request_path=request.path)
 
@@ -1423,12 +1988,9 @@ class StoneCrab:
             if (
                 isclass(handler)
                 and allowed is not None
-                and request.method not in allowed
-            ):
+                and request.method not in allowed):
                 response.status_code = 405
-                response.headers.setdefault(
-                    "Content-Type", f"text/plain; charset={response.charset}"
-                )
+                response.headers.setdefault("Content-Type", f"text/plain; charset={response.charset}")
                 response.text = STATUS_CODES[405]
                 return response
 
@@ -1550,7 +2112,6 @@ class View(object):
         Наследники переопределяют нужные методы; диспетчер вызывает
         get, post и т.д. в зависимости от request.method.
     """
-
     def __init__(self):
         pass
 
@@ -1592,8 +2153,7 @@ tokens = {
     "comment_start": "{#",
     "comment_end": "#}",
     "var_start": "{{",
-    "var_end": "}}",
-}
+    "var_end": "}}"}
 
 types = {
     "comment": 0,
@@ -1602,8 +2162,7 @@ types = {
     "extends": 3,
     "static": 4,
     "text": 5,
-    "var": 6,
-}
+    "var": 6}
 
 
 operator_lookup_table = {
@@ -1612,8 +2171,7 @@ operator_lookup_table = {
     "==": operator.eq,
     "!=": operator.ne,
     "<=": operator.le,
-    ">=": operator.ge,
-}
+    ">=": operator.ge}
 
 
 def eval_expression(expr):
@@ -1663,7 +2221,6 @@ class Base(object):
     Notes:
         Подклассы реализуют render для вывода фрагмента HTML.
     """
-
     def __init__(self, fragment=None):
         self.fragment = fragment
 
@@ -1769,9 +2326,7 @@ class Variable(Base):
                                 if self.fragment == key:
                                     self.fragment = value[key]
                 else:
-                    Messages.out_error(
-                        "Variable: ожидался dict или tuple с dict в контексте"
-                    )
+                    Messages.out_error("Variable: ожидался dict или tuple с dict в контексте")
         return str(self.fragment)
 
 
@@ -1890,7 +2445,6 @@ class Compiler(object):
         Дополнительные позиционные и именованные аргументы передаются в узлы
         переменных (например, render("x.html", key=value)).
     """
-
     def __init__(self, template: str, *args, **kwargs):
         self.args = args
         self.template_name = template
@@ -1964,9 +2518,7 @@ class Compiler(object):
 
     def get_template_path(self):
         """Абсолютный путь к файлу шаблона в каталоге TEMPLATE_DIRS."""
-        base = getattr(
-            settings, "TEMPLATE_DIRS", os.path.join(os.getcwd(), "templates")
-        )
+        base = getattr(settings, "TEMPLATE_DIRS", os.path.join(os.getcwd(), "templates"))
         return os.path.join(os.path.abspath(base), self.template_name)
 
     def open_file(self, path):
@@ -2002,13 +2554,15 @@ class Management:
     Notes:
         Запуск: python stonecrab.py startproject из целевого каталога.
     """
-
     def __init__(self):
         parser = argparse.ArgumentParser()
         subparsers = parser.add_subparsers(dest="command")
         startapp = subparsers.add_parser("startapp")
         startapp.add_argument("name")
         startproject = subparsers.add_parser("startproject")
+        runserver = subparsers.add_parser("runserver")
+        runserver.add_argument("--host", default="127.0.0.1")
+        runserver.add_argument("--port", type=int, default=8000)
         self.parser = parser
 
     def create_errors_html_pages(self):
@@ -2018,34 +2572,37 @@ class Management:
             return (
                 '<!DOCTYPE html><html lang="en"><head>'
                 '<meta charset="utf-8"><title>%s</title></head><body>'
-                "<h1>%s</h1>%s</body></html>"
-            ) % (title, title, body_extra)
+                "<h1>%s</h1>%s</body></html>") % (title, title, body_extra)
 
-        Utilities.FileSystem.create_file(
-            name="templates/errors/404.html", content=page("404 Not Found")
-        )
+        Utilities.FileSystem.create_file(name="templates/errors/404.html", content=page("404 Not Found"))
         Messages.info_create_file("templates/errors/404.html")
-        Utilities.FileSystem.create_file(
-            name="templates/errors/500.html", content=page("500 Internal Server Error")
-        )
+        Utilities.FileSystem.create_file(name="templates/errors/500.html", content=page("500 Internal Server Error"))
         Messages.info_create_file("templates/errors/500.html")
         Utilities.FileSystem.create_file(
             name="templates/errors/501.html",
-            content=page("501 Not Implemented", "<p>Method: {{ method }}</p>"),
-        )
+            content=page("501 Not Implemented", "<p>Method: {{ method }}</p>"))
         Messages.info_create_file("templates/errors/501.html")
 
     def create_settings(self):
-        """Записывает в корень проекта файл settings.py с настройками по умолчанию."""
-        Utilities.FileSystem.create_file(name="settings.py", content=settings_template)
-        Messages.info_create_file("settings.py")
+        """Создаёт пакет settings/: __init__.py, base.py, development.py, production.py."""
+        Utilities.FileSystem.create_folder("settings")
+        Utilities.FileSystem.create_file(name="settings/__init__.py", content=SETTINGS_INIT_PY)
+        Messages.info_create_file("settings/__init__.py")
+        Utilities.FileSystem.create_file(name="settings/base.py", content=SETTINGS_BASE_PY)
+        Messages.info_create_file("settings/base.py")
+        Utilities.FileSystem.create_file(name="settings/development.py", content=SETTINGS_DEVELOPMENT_PY)
+        Messages.info_create_file("settings/development.py")
+        Utilities.FileSystem.create_file(name="settings/production.py", content=SETTINGS_PRODUCTION_PY)
+        Messages.info_create_file("settings/production.py")
 
     def create_wsgi(self):
-        """Создаёт точку входа wsgi.py с объектом application."""
-        Utilities.FileSystem.create_file(
-            name="wsgi.py",
-            content="from stonecrab import StoneCrab\n\napplication = " "StoneCrab()\n",
-        )
+        """Создаёт wsgi.py: STONECRAB_ENV=production по умолчанию для воркера."""
+        wsgi_body = (
+            "import os\n"
+            'os.environ.setdefault("STONECRAB_ENV", "production")\n\n'
+            "from stonecrab import StoneCrab\n\n"
+            "application = StoneCrab()\n")
+        Utilities.FileSystem.create_file(name="wsgi.py", content=wsgi_body)
         Messages.info_create_file("wsgi.py")
 
     def startapp(self, name, url_prefix=None):
@@ -2069,9 +2626,7 @@ class Management:
                 name=f"{apps_name}/routes.py",
                 content=(
                     f"from . import views\n\n"
-                    f"URL_PREFIX = '{url_prefix}'\n\nurls = {{}}\n"
-                ),
-            )
+                    f"URL_PREFIX = '{url_prefix}'\n\nurls = {{}}\n"))
             Utilities.FileSystem.create_file(f"{apps_name}/views.py")
             Messages.info_create_app(name)
         except FileNotFoundError:
@@ -2084,26 +2639,19 @@ class Management:
         Notes:
             Вызывается из startproject после startapp(..., index).
         """
-        Utilities.FileSystem.create_file(
-            name="apps/index/views.py", content=views_template
-        )
-        Utilities.FileSystem.create_file(
-            name="apps/index/routes.py", content=routes_template
-        )
+        Utilities.FileSystem.create_file(name="apps/index/views.py", content=views_template)
+        Utilities.FileSystem.create_file(name="apps/index/routes.py", content=routes_template)
         index_html = (
             '<!DOCTYPE html><html lang="en"><head>'
             '<meta charset="utf-8"><title>{{ title }}</title></head>'
             "<body><h1>{{ title }}</h1>"
-            "<p>{{ welcom }}</p><p>{{ version }}</p></body></html>"
-        )
-        Utilities.FileSystem.create_file(
-            name="templates/index.html", content=index_html
-        )
+            "<p>{{ welcom }}</p><p>{{ version }}</p></body></html>")
+        Utilities.FileSystem.create_file(name="templates/index.html", content=index_html)
         Messages.info_upd_app("index")
 
     def startproject(self):
         """
-        Создаёт каркас проекта: каталоги, settings.py, wsgi.py, приложение index.
+        Создаёт каркас проекта: каталоги, пакет settings/, wsgi.py, приложение index.
 
         Raises:
             OSError: При ошибках создания файловой системы (права, занятый путь).
@@ -2135,6 +2683,20 @@ class Management:
         self.update_app_index()
 
 
+def run_dev_server(host="127.0.0.1", port=8000):
+    """
+    Встроенный dev-сервер (wsgiref).
+
+    Окружение конфигурации — как при импорте settings (см. STONECRAB_ENV в settings/__init__.py).
+    """
+    from wsgiref.simple_server import make_server
+
+    app = StoneCrab()
+    srv = make_server(host, port, app)
+    log_event("dev_server_start", host=host, port=port)
+    srv.serve_forever()
+
+
 if __name__ == "__main__":
     management = Management()
     namespace = management.parser.parse_args(sys.argv[1:])
@@ -2144,6 +2706,8 @@ if __name__ == "__main__":
             management.startapp(name=namespace.name)
         elif namespace.command == "startproject":
             management.startproject()
+        elif namespace.command == "runserver":
+            run_dev_server(host=namespace.host, port=namespace.port)
         else:
             Messages.error_unknown_parameter()
     else:
