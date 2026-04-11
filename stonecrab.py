@@ -1,17 +1,20 @@
 import argparse
 import ast
+import calendar
 import contextlib
-import ftplib
-import json
 import email.message
 import email.utils
+import ftplib
+import hashlib
 import hmac
+import io
+import json
 import mimetypes
 import operator
 import os
+import platform
 import re
 import secrets
-import platform
 import smtplib
 import socket
 import ssl
@@ -20,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import types
 import uuid
 import urllib.parse
@@ -31,7 +35,9 @@ from pathlib import Path
 
 try:
     import settings
-except ImportError:
+except ModuleNotFoundError as _settings_exc:
+    if getattr(_settings_exc, "name", None) != "settings":
+        raise
     _cwd = os.getcwd()
     settings = types.SimpleNamespace(
         PROJECT_DIR=_cwd,
@@ -40,21 +46,128 @@ except ImportError:
         STATIC_URL="/static/",
         STATIC_DIR=os.path.join(_cwd, "static"),
         TEMPLATE_DIRS=os.path.join(_cwd, "templates"),
-        MIDDLEWARE=[])
+        MIDDLEWARE=[],
+        SECRET_KEY=os.environ.get("STONECRAB_SECRET_KEY", ""),
+        DEBUG=False,
+        REQUEST_ID_TRUST_CLIENT=False,
+        RESPONSE_REQUEST_ID_HEADER=True,
+        CSP_USE_NONCE=False,
+        UPLOAD_FORBIDDEN_EXTENSIONS=(),
+    )
 
-# TODO: Написать тесты
 # TODO: Посмотреть видео про параллельный запуск скриптов, попробовать внедрить
 # TODO: Сделать бенчмарк с Flask, Bottle, Web2py, Sanic, Tornado, Falcon, Pyramid, Django
 # TODO: Реализовать загрузку файла через форму на странице
 # TODO: Проверить работу с nginx
 # TODO: Прочитать про Spider (асинхронные запросы)
-# TODO: Сделать в routes именованный параметр как as_view в Django
-# TODO: COOKIE_KEY / secret_key для подписи cookie
-
 # **********************************************************************
 # ************************** Session storage ***************************
 # **********************************************************************
 SESSION_STORE = {}
+
+PATH_CONVERTER_SEGMENT_RE = re.compile(r"^<([a-z]+):([a-zA-Z_]\w*)>$")
+
+PATH_CONVERTER_REGISTRY = {}
+
+
+def register_path_converter(name, func):
+    """
+    Регистрирует конвертер для сегмента пути в нотации угловых скобок (тип и имя параметра).
+
+    Args:
+        name: Имя типа в шаблоне маршрута.
+        func: Вызываемый объект func(raw: str) -> значение; при ошибке преобразования — ValueError или TypeError.
+
+    Returns:
+        None.
+    """
+    PATH_CONVERTER_REGISTRY[str(name).lower()] = func
+
+
+def convert_path_segment(conv, raw):
+    """Преобразует сегмент пути по имени конвертера (синтаксис <type:name>)."""
+    custom = PATH_CONVERTER_REGISTRY.get(conv)
+    if custom is not None:
+        return custom(raw)
+    if conv == "str":
+        return raw
+    if conv == "int":
+        if not re.fullmatch(r"-?\d+", raw):
+            raise ValueError
+        return int(raw)
+    if conv == "slug":
+        if not re.fullmatch(r"[a-zA-Z0-9_\-]+", raw):
+            raise ValueError
+        return raw
+    if conv == "uuid":
+        return str(uuid.UUID(raw))
+    raise ValueError
+
+
+APP_HOOK_LISTS = {"before_request": [], "after_request": []}
+
+
+def register_hook(phase, fn):
+    """
+    Регистрирует хук жизненного цикла в дополнение к спискам BEFORE_REQUEST_HOOKS и AFTER_REQUEST_HOOKS в settings.
+
+    Args:
+        phase: Строка before_request (вызов fn(request)) или after_request (вызов fn(request, response)).
+        fn: Вызываемый объект хука.
+
+    Raises:
+        ValueError: Если значение phase не поддерживается.
+    """
+    lst = APP_HOOK_LISTS.get(phase)
+
+    if lst is None:
+        raise ValueError("phase must be before_request or after_request")
+    lst.append(fn)
+
+
+def clear_hooks(phase=None):
+    """Очищает глобальные хуки (все или только phase)."""
+    if phase is None:
+        for k in APP_HOOK_LISTS:
+            APP_HOOK_LISTS[k].clear()
+    else:
+        APP_HOOK_LISTS.get(phase, []).clear()
+
+
+def read_session_secret():
+    key = getattr(settings, "SECRET_KEY", None)
+
+    if key is None or str(key).strip() == "":
+        return None
+    return str(key).strip()
+
+
+def session_cookie_pack(secret, sid):
+    sig = hmac.new(secret.encode("utf-8"), sid.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{sid}.{sig}"
+
+
+def session_cookie_unpack(secret, raw):
+    if not raw:
+        return None
+
+    if not secret:
+        return raw
+
+    if "." not in raw:
+        return None
+
+    sid, sig = raw.rsplit(".", 1)
+
+    if not sid:
+        return None
+
+    expected = hmac.new(secret.encode("utf-8"), sid.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(expected, sig):
+        return None
+
+    return sid
 
 
 # **********************************************************************
@@ -76,9 +189,12 @@ def flatten_parse_result(qs_dict):
         Словарь имя -> str.
     """
     out = {}
+
     for k, v in qs_dict.items():
+
         if v:
             out[k] = v[-1]
+
     return out
 
 
@@ -106,16 +222,21 @@ def build_set_cookie_value(
         Строка тела cookie для заголовка Set-Cookie.
     """
     parts = [f"{name}={value}", f"Path={path}"]
+
     if max_age is not None:
         parts.append(f"Max-Age={int(max_age)}")
+
     if httponly:
         parts.append("HttpOnly")
+
     if secure:
         parts.append("Secure")
+
     if samesite and str(samesite).lower() != "none":
         parts.append(f"SameSite={samesite}")
     elif str(samesite).lower() == "none":
         parts.append("SameSite=None")
+
     return "; ".join(parts)
 
 
@@ -198,10 +319,10 @@ def parse_multipart_body(body, boundary, default_charset="utf-8"):
 
 CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
-_CACHE_LOCK = threading.Lock()
-_RESPONSE_CACHE = {}
-_IDEMPOTENCY_CACHE = {}
-_RATE_BUCKET = {}
+APP_CACHE_LOCK = threading.Lock()
+APP_RESPONSE_CACHE = {}
+APP_IDEMPOTENCY_CACHE = {}
+APP_RATE_BUCKETS = {}
 
 
 def log_event(event, **fields):
@@ -253,26 +374,58 @@ def validate_payload(data, schema):
     return errors
 
 
+def merge_openapi_operation(base_op, extra):
+    if not extra:
+        return base_op
+    out = dict(base_op)
+    for k, v in extra.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            merged = dict(out[k])
+            merged.update(v)
+            out[k] = merged
+        else:
+            out[k] = v
+    return out
+
+
 def build_openapi_spec(routes):
-    """Минимальная OpenAPI 3.0: paths и HTTP-методы из @route / View."""
+    """OpenAPI 3.0: paths, методы; опционально фрагменты из @route(..., openapi={...})."""
     paths = {}
     for path, handler in sorted(routes.items(), key=lambda x: x[0]):
         p = path.rstrip("/") or "/"
         entry = {}
+        oa = getattr(handler, ROUTE_ATTR_OPENAPI, None) or {}
+        star = oa.get("*") if isinstance(oa, dict) else None
         if isclass(handler):
-            allowed = getattr(handler, STONE_CRAB_METHODS, None) or frozenset(("GET", "HEAD", "OPTIONS"))
+            allowed = getattr(handler, ROUTE_ATTR_METHODS, None) or frozenset(("GET", "HEAD", "OPTIONS"))
             for m in sorted(allowed):
-                entry[m.lower()] = {
+                ml = m.lower()
+                op = {
                     "summary": handler.__name__,
-                    "responses": {"200": {"description": "OK"}}}
+                    "responses": {
+                        "200": {"description": "OK"},
+                        "400": {"description": "Bad Request"},
+                        "500": {"description": "Internal Server Error"},
+                    },
+                }
+                ex = star or oa.get(ml) or {}
+                entry[ml] = merge_openapi_operation(op, ex)
         else:
-            allowed = getattr(handler, STONE_CRAB_METHODS, frozenset(("GET", "HEAD", "OPTIONS")))
+            allowed = getattr(handler, ROUTE_ATTR_METHODS, frozenset(("GET", "HEAD", "OPTIONS")))
             for m in sorted(allowed):
-                entry[m.lower()] = {
+                ml = m.lower()
+                op = {
                     "summary": getattr(handler, "__name__", "handler"),
-                    "responses": {"200": {"description": "OK"}}}
+                    "responses": {
+                        "200": {"description": "OK"},
+                        "400": {"description": "Bad Request"},
+                        "500": {"description": "Internal Server Error"},
+                    },
+                }
+                ex = star or oa.get(ml) or {}
+                entry[ml] = merge_openapi_operation(op, ex)
         paths[p] = entry
-    return {"openapi": "3.0.0", "info": {"title": "StoneCrab", "version": "1.0"}, "paths": paths}
+    return {"openapi": "3.0.0", "info": {"title": "HTTP API", "version": "1.0"}, "paths": paths}
 
 # **********************************************************************
 # ***************************** Status codes ***************************
@@ -307,11 +460,12 @@ STATUS_CODES = {
 
 
 # Имена атрибутов, которые выставляет декоратор route()
-STONE_CRAB_ROUTE = "_stonecrab_route"
-STONE_CRAB_METHODS = "_stonecrab_methods"
+ROUTE_ATTR_PATH = "_framework_route_path"
+ROUTE_ATTR_METHODS = "_framework_route_methods"
+ROUTE_ATTR_OPENAPI = "_framework_route_openapi"
 
 
-def route(path, methods=None):
+def route(path, methods=None, openapi=None):
     """
     Декоратор для функции или класса View: привязка к URL и списку HTTP-методов.
 
@@ -319,8 +473,11 @@ def route(path, methods=None):
     наряду с явным словарём urls в routes.py.
 
     Args:
-        path: Путь относительно префикса приложения (как в urls).
+        path: Путь относительно префикса приложения. Именованные сегменты: фигурные скобки с именем
+            или угловые скобки с типом и именем (int, str, slug, uuid), по аналогии с Django path().
         methods: Кортеж методов (по умолчанию GET, HEAD, OPTIONS).
+        openapi: Необязательный словарь для OpenAPI (ключи — методы в нижнем регистре или звёздочка
+            для всех методов маршрута); сливается в объект операции спецификации.
 
     Returns:
         Декоратор, возвращающий исходный объект с метаданными маршрута.
@@ -328,8 +485,10 @@ def route(path, methods=None):
     allowed = tuple(m.upper() for m in (methods or ("GET", "HEAD", "OPTIONS")))
 
     def decorator(target):
-        setattr(target, STONE_CRAB_ROUTE, path)
-        setattr(target, STONE_CRAB_METHODS, frozenset(allowed))
+        setattr(target, ROUTE_ATTR_PATH, path)
+        setattr(target, ROUTE_ATTR_METHODS, frozenset(allowed))
+        if openapi is not None:
+            setattr(target, ROUTE_ATTR_OPENAPI, openapi)
         return target
 
     return decorator
@@ -357,6 +516,10 @@ def wrap_view_method_guard(view_callable, allowed_methods):
 
         return view_callable(request, response, **kwargs)
 
+    guarded.__name__ = getattr(view_callable, "__name__", "guarded")
+    for attr in (ROUTE_ATTR_PATH, ROUTE_ATTR_METHODS, ROUTE_ATTR_OPENAPI):
+        if hasattr(view_callable, attr):
+            setattr(guarded, attr, getattr(view_callable, attr))
     return guarded
 
 
@@ -400,8 +563,15 @@ import os
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SECRET_KEY = os.environ.get("STONECRAB_SECRET_KEY", "change-me-in-production")
+DEBUG = False
 
-SESSION_COOKIE_NAME = "stonecrab_sid"
+REQUEST_ID_TRUST_CLIENT = False
+RESPONSE_REQUEST_ID_HEADER = True
+CSP_USE_NONCE = False
+CONTENT_SECURITY_POLICY = None
+UPLOAD_FORBIDDEN_EXTENSIONS = ()
+
+SESSION_COOKIE_NAME = "demo_sid"
 CSRF_HEADER_NAME = "X-CSRF-Token"
 AUTH_SESSION_KEY = "auth_user_id"
 SESSION_COOKIE_SECURE = None
@@ -431,6 +601,7 @@ AFTER_REQUEST_HOOKS = []
 # Порядок: внешний слой первым (ближе к клиенту).
 MIDDLEWARE = [
     "TrustedHostMiddleware",
+    "RequestIdMiddleware",
     "RequestLimitsMiddleware",
     "RateLimitMiddleware",
     "CorsMiddleware",
@@ -849,7 +1020,12 @@ class Utilities:
             return slug
 
         def parse(path, request_path):
-            """Парсим url, и возвращаем значения, если они есть"""
+            """
+            Сопоставляет шаблон пути с путём запроса.
+
+            Плейсхолдеры: сегмент в фигурных скобках с именем (строка как есть) и сегмент в угловых скобках
+            с именем конвертера и параметра — как в Django path(): int, str, slug, uuid. Значения попадают в kwargs view.
+            """
             path = path.strip().strip("/").strip().split("/")
             request_path = request_path.strip("/").split("/")
             variables = {}
@@ -857,24 +1033,31 @@ class Utilities:
             if path == request_path:
                 result["status"], result["variables"] = True, {}
                 return result
-            else:
-                if len(path) == len(request_path):
-                    for num in range(0, len(request_path)):
-                        if path[num].strip() == request_path[num].strip():
-                            continue
-                        elif Utilities.check_var(path[num]):
-                            key = path[num].strip("{").strip("}").strip()
-                            variables[key] = request_path[num]
-                            continue
-                        else:
-                            result["status"], result["variables"] = False, {}
-                            return result
-                    result["status"], result["variables"] = True, variables
-                    return result
-                else:
-                    result["status"], result["variables"] = False, {}
-
-                    return result
+            if len(path) != len(request_path):
+                result["status"], result["variables"] = False, {}
+                return result
+            for num in range(len(request_path)):
+                pseg = path[num].strip()
+                rseg = request_path[num].strip()
+                if pseg == rseg:
+                    continue
+                m = PATH_CONVERTER_SEGMENT_RE.match(pseg)
+                if m:
+                    conv, key = m.group(1), m.group(2)
+                    try:
+                        variables[key] = convert_path_segment(conv, rseg)
+                    except (ValueError, TypeError):
+                        result["status"], result["variables"] = False, {}
+                        return result
+                    continue
+                if Utilities.check_var(path[num]):
+                    key = path[num].strip("{").strip("}").strip()
+                    variables[key] = rseg
+                    continue
+                result["status"], result["variables"] = False, {}
+                return result
+            result["status"], result["variables"] = True, variables
+            return result
 
     def transliterate_ru(string):
         """Транслитерация символов русского языка в латиницу"""
@@ -1040,24 +1223,17 @@ class Utilities:
         Форматирует datetime в строку даты по RFC 822 / RFC 1123 (английские имена).
 
         Args:
-            dt: Время с временной зоной (ожидается UTC для корректной подписи GMT).
+            dt: Время; для наивного экземпляра метод utctimetuple трактует его как локальное время процесса
+                (как у datetime.utctimetuple).
 
         Returns:
             Строка вида Sun, 06 Nov 1994 08:49:37 GMT.
 
         Notes:
-            Не использует strftime, чтобы не зависеть от локали для имён дней и месяцев.
+            Используется email.utils.formatdate (как для HTTP-дат), без strftime — имена дней и месяцев
+            не зависят от локали пользователя.
         """
-        t = dt.utctimetuple()
-        _m = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-        return "%s, %02d %s %04d %02d:%02d:%02d GMT" % (
-            ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[t[6]],
-            t[2],
-            _m[t[1] - 1],
-            t[0],
-            t[3],
-            t[4],
-            t[5])
+        return email.utils.formatdate(calendar.timegm(dt.utctimetuple()), usegmt=True)
 
 
 # **********************************************************************
@@ -1074,9 +1250,6 @@ class EMail:
         subject="",
         to="",
         message="",):
-        self._server = server
-        self._login = login
-        self._password = password
         self.mail = smtplib.SMTP(server)
         try:
             self.mail.starttls()
@@ -1151,6 +1324,24 @@ class Request(object):
                         break
                 self.POST, self.FILES = parse_multipart_body(self.body, boundary, self.charset)
 
+        self.upload_rejected_reason = None
+        _forb = getattr(settings, "UPLOAD_FORBIDDEN_EXTENSIONS", None) or ()
+        if self.FILES and _forb:
+            _fb = tuple(x.lower() for x in _forb)
+            for meta in self.FILES.values():
+                fn = (meta.get("filename") or "").lower()
+                if any(fn.endswith(suf) for suf in _fb):
+                    self.upload_rejected_reason = "upload: forbidden file extension"
+                    self.FILES = {}
+                    break
+
+        if getattr(settings, "REQUEST_ID_TRUST_CLIENT", False):
+            _rid = (environ.get("HTTP_X_REQUEST_ID") or "").strip()[:200]
+            self.request_id = _rid or uuid.uuid4().hex
+        else:
+            self.request_id = uuid.uuid4().hex
+
+        self.csp_nonce = None
         self.session = {}
         self.session_id = None
         self.session_is_new = False
@@ -1349,6 +1540,13 @@ class TrustedHostMiddleware(Middleware):
         return Middleware.__call__(self, environ, start_response)
 
 
+class RequestIdMiddleware(Middleware):
+    """Пробрасывает request_id запроса в заголовок ответа X-Request-Id; идентификатор задаётся в классе Request."""
+    def process_response(self, request, response):
+        if getattr(settings, "RESPONSE_REQUEST_ID_HEADER", True):
+            response.headers.setdefault("X-Request-Id", getattr(request, "request_id", "") or "")
+
+
 class RequestLimitsMiddleware(Middleware):
     """Лимит размера тела (CONTENT_LENGTH) и числа заголовков запроса."""
     def __call__(self, environ, start_response):
@@ -1390,8 +1588,8 @@ class RateLimitMiddleware(Middleware):
         now = time.time()
         window = 60.0
 
-        with _CACHE_LOCK:
-            bucket = _RATE_BUCKET.setdefault(ip, [])
+        with APP_CACHE_LOCK:
+            bucket = APP_RATE_BUCKETS.setdefault(ip, [])
             bucket[:] = [t for t in bucket if now - t < window]
             if len(bucket) >= lim:
                 r = Response()
@@ -1407,7 +1605,7 @@ class RateLimitMiddleware(Middleware):
 
 class CorsMiddleware(Middleware):
     """CORS: ответ OPTIONS и заголовки по CORS_ORIGINS (пусто = выкл.)."""
-    def _apply_cors(self, request, response, origins):
+    def apply_cors(self, request, response, origins):
         origin = request.environ.get("HTTP_ORIGIN", "")
         if "*" in origins:
             allow = "*"
@@ -1428,7 +1626,7 @@ class CorsMiddleware(Middleware):
     def process_response(self, request, response):
         origins = list(getattr(settings, "CORS_ORIGINS", None) or [])
         if origins:
-            self._apply_cors(request, response, origins)
+            self.apply_cors(request, response, origins)
 
     def dispatch_request(self, request):
         origins = list(getattr(settings, "CORS_ORIGINS", None) or [])
@@ -1545,8 +1743,8 @@ class IdempotencyMiddleware(Middleware):
         ck = f"POST|{request.path}|{key}"
         now = time.time()
 
-        with _CACHE_LOCK:
-            ent = _IDEMPOTENCY_CACHE.get(ck)
+        with APP_CACHE_LOCK:
+            ent = APP_IDEMPOTENCY_CACHE.get(ck)
             if ent and ent[0] > now:
                 self.process_request(request)
                 _, status, hdrs, text = ent
@@ -1557,21 +1755,21 @@ class IdempotencyMiddleware(Middleware):
                 self.process_response(request, r)
                 return r
 
-        request._idempotency_ck = ck
-        request._idempotency_ttl = ttl
+        request.idempotency_cache_key = ck
+        request.idempotency_cache_ttl_sec = ttl
         return Middleware.dispatch_request(self, request)
 
     def process_response(self, request, response):
-        ck = getattr(request, "_idempotency_ck", None)
+        ck = getattr(request, "idempotency_cache_key", None)
         if not ck:
             return
 
         if int(response.status_code) >= 500:
             return
 
-        with _CACHE_LOCK:
-            _IDEMPOTENCY_CACHE[ck] = (
-                time.time() + request._idempotency_ttl,
+        with APP_CACHE_LOCK:
+            APP_IDEMPOTENCY_CACHE[ck] = (
+                time.time() + request.idempotency_cache_ttl_sec,
                 int(response.status_code),
                 dict(response.headers),
                 response.text)
@@ -1586,8 +1784,8 @@ class ResponseCacheMiddleware(Middleware):
 
         if ttl > 0 and request.method == "GET":
             ck = f"{request.path}?{request.environ.get('QUERY_STRING', '')}"
-            with _CACHE_LOCK:
-                ent = _RESPONSE_CACHE.get(ck)
+            with APP_CACHE_LOCK:
+                ent = APP_RESPONSE_CACHE.get(ck)
                 if ent and ent[0] > now:
                     self.process_request(request)
                     _, status, hdrs, text = ent
@@ -1606,8 +1804,8 @@ class ResponseCacheMiddleware(Middleware):
             and request.method == "GET"
             and int(response.status_code) == 200
             and response.stream is None):
-            with _CACHE_LOCK:
-                _RESPONSE_CACHE[ck] = (
+            with APP_CACHE_LOCK:
+                APP_RESPONSE_CACHE[ck] = (
                     time.time() + ttl,
                     int(response.status_code),
                     dict(response.headers),
@@ -1617,14 +1815,18 @@ class ResponseCacheMiddleware(Middleware):
 
 
 class RequestHooksMiddleware(Middleware):
-    """Хуки BEFORE_REQUEST_HOOKS(request) и AFTER_REQUEST_HOOKS(request, response)."""
+    """Хуки settings и register_hook(): before/after request."""
     def dispatch_request(self, request):
-        for hook in getattr(settings, "BEFORE_REQUEST_HOOKS", None) or []:
+        for hook in (getattr(settings, "BEFORE_REQUEST_HOOKS", None) or []) + APP_HOOK_LISTS[
+            "before_request"
+        ]:
             hook(request)
 
         response = self.app.dispatch_request(request)
 
-        for hook in getattr(settings, "AFTER_REQUEST_HOOKS", None) or []:
+        for hook in (getattr(settings, "AFTER_REQUEST_HOOKS", None) or []) + APP_HOOK_LISTS[
+            "after_request"
+        ]:
             hook(request, response)
 
         return response
@@ -1727,7 +1929,8 @@ class LogMiddleware(Middleware):
             method=request.method,
             path=request.path,
             status=int(response.status_code),
-            remote_addr=request.environ.get("REMOTE_ADDR"))
+            remote_addr=request.environ.get("REMOTE_ADDR"),
+            request_id=getattr(request, "request_id", None))
 
 
 class MessageMiddleware(Middleware):
@@ -1744,7 +1947,14 @@ class MessageMiddleware(Middleware):
             response.text = render("errors/404.html")
         elif code == 500:
             Messages.error_response(request, response)
-            response.text = render("errors/500.html")
+            if (
+                getattr(settings, "DEBUG", False)
+                and response.text
+                and "Traceback (most recent call last)" in response.text
+            ):
+                pass
+            else:
+                response.text = render("errors/500.html")
         elif code == 501:
             Messages.error_response(request, response)
             response.text = render("errors/501.html", method=f"{request.method.upper()}")
@@ -1753,14 +1963,24 @@ class MessageMiddleware(Middleware):
 class SecurityMiddleware(Middleware):
     """Заголовки безопасности по умолчанию (строгий базовый набор)."""
 
+    def process_request(self, request):
+        if getattr(settings, "CSP_USE_NONCE", False):
+            request.csp_nonce = secrets.token_urlsafe(16)
+
     def process_response(self, request, response):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-        response.headers.setdefault(
-            "Content-Security-Policy",
-            "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+        csp = getattr(settings, "CONTENT_SECURITY_POLICY", None)
+        if csp is None:
+            csp = (
+                "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+            )
+        nonce = getattr(request, "csp_nonce", None)
+        if nonce and getattr(settings, "CSP_USE_NONCE", False):
+            csp = f"{csp}; script-src 'self' 'nonce-{nonce}'"
+        response.headers.setdefault("Content-Security-Policy", csp)
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
         response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
 
@@ -1773,8 +1993,10 @@ class SessionMiddleware(Middleware):
         Хранилище не разделяется между отдельными worker-процессами WSGI.
     """
     def process_request(self, request):
-        name = getattr(settings, "SESSION_COOKIE_NAME", "stonecrab_sid")
-        sid = request.get_cookies().get(name)
+        name = getattr(settings, "SESSION_COOKIE_NAME", "demo_sid")
+        secret = read_session_secret()
+        raw = request.get_cookies().get(name)
+        sid = session_cookie_unpack(secret, raw) if raw else None
         if sid and sid in SESSION_STORE:
             request.session_id = sid
             request.session = SESSION_STORE[sid]
@@ -1788,13 +2010,19 @@ class SessionMiddleware(Middleware):
 
     def process_response(self, request, response):
         if getattr(request, "session_is_new", False):
-            name = getattr(settings, "SESSION_COOKIE_NAME", "stonecrab_sid")
+            name = getattr(settings, "SESSION_COOKIE_NAME", "demo_sid")
             sec = getattr(settings, "SESSION_COOKIE_SECURE", None)
             if sec is None:
                 sec = request.environ.get("wsgi.url_scheme") == "https"
             samesite = getattr(settings, "SESSION_COOKIE_SAMESITE", "Lax")
+            secret = read_session_secret()
+            cookie_val = (
+                session_cookie_pack(secret, request.session_id)
+                if secret
+                else request.session_id
+            )
             response.cookies[name] = {
-                "value": request.session_id,
+                "value": cookie_val,
                 "secure": bool(sec),
                 "samesite": samesite,
                 "httponly": True,
@@ -1979,11 +2207,18 @@ class StoneCrab:
             r.text = json.dumps(build_openapi_spec(self.routes))
             return r
 
+        if getattr(request, "upload_rejected_reason", None):
+            response = Response()
+            response.status_code = 403
+            response.headers.setdefault("Content-Type", f"text/plain; charset={request.charset}")
+            response.text = request.upload_rejected_reason
+            return response
+
         response = Response()
         handler, kwargs = self.find_handler(request_path=request.path)
 
         if handler is not None:
-            allowed = getattr(handler, STONE_CRAB_METHODS, None)
+            allowed = getattr(handler, ROUTE_ATTR_METHODS, None)
 
             if (
                 isclass(handler)
@@ -2003,7 +2238,25 @@ class StoneCrab:
                     return response
                 handler = view_method
 
-            result = handler(request, response, **kwargs)
+            try:
+                result = handler(request, response, **kwargs)
+            except Exception as exc:
+                log_event(
+                    "unhandled_exception",
+                    path=request.path,
+                    request_id=getattr(request, "request_id", None),
+                    exc_type=type(exc).__name__,
+                    exc_msg=str(exc),
+                )
+                if getattr(settings, "DEBUG", False):
+                    response.status_code = 500
+                    response.headers.setdefault("Content-Type", "text/plain; charset=utf-8")
+                    response.text = traceback.format_exc()
+                else:
+                    response.status_code = 500
+                    response.headers.setdefault("Content-Type", f"text/plain; charset={response.charset}")
+                    response.text = STATUS_CODES[500]
+                return response
 
             if isinstance(result, Response):
                 return result
@@ -2078,19 +2331,19 @@ class StoneCrab:
 
                 obj = getattr(views_module, name)
 
-                if not hasattr(obj, STONE_CRAB_ROUTE):
+                if not hasattr(obj, ROUTE_ATTR_PATH):
                     continue
 
                 if not (isfunction(obj) or isclass(obj)):
                     continue
 
-                raw_path = getattr(obj, STONE_CRAB_ROUTE)
+                raw_path = getattr(obj, ROUTE_ATTR_PATH)
                 path = Utilities.URL.add_slash(raw_path)
                 full_path = f"{prefix}{path}"
                 handler = obj
 
                 if not isclass(handler):
-                    methods = getattr(handler, STONE_CRAB_METHODS, frozenset())
+                    methods = getattr(handler, ROUTE_ATTR_METHODS, frozenset())
                     handler = wrap_view_method_guard(handler, methods)
 
                 try:
@@ -2109,8 +2362,9 @@ class View(object):
     Базовый класс представления с методами по HTTP-глаголам (заглушки 501).
 
     Notes:
-        Наследники переопределяют нужные методы; диспетчер вызывает
-        get, post и т.д. в зависимости от request.method.
+        Наследники переопределяют нужные методы; диспетчер вызывает get, post и т.д. в зависимости от
+        request.method. Именованные сегменты пути (фигурные скобки или угловые конвертеры) передаются как kwargs,
+        по аналогии с as_view() в Django.
     """
     def __init__(self):
         pass
@@ -2212,6 +2466,7 @@ def resolve(name, context):
         return context
     except KeyError:
         Messages.out_error("KeyError")
+        return None
 
 
 class Base(object):
@@ -2285,6 +2540,20 @@ class Static(Base):
         return link
 
 
+class Include(Base):
+    """Вставка вложенного шаблона директивой include с тем же контекстом, что у родительского шаблона."""
+    def __init__(self, fragment_clean, cargs, ckwargs):
+        self.render_positional_args = cargs
+        self.render_keyword_args = ckwargs
+        mo = re.match(r"include\s+[\"']([^\"']+)[\"']\s*$", fragment_clean.strip())
+        self.sub_template = mo.group(1) if mo else ""
+
+    def render(self):
+        if not self.sub_template:
+            return ""
+        return render(self.sub_template, *self.render_positional_args, **self.render_keyword_args)
+
+
 class Text(Base):
     """Узел неформатированного текста."""
 
@@ -2302,7 +2571,8 @@ class Variable(Base):
     """Узел подстановки переменной {{ name }} из контекста."""
 
     def __init__(self, fragment=None, *args, **kwargs):
-        self.args = args
+        self._context_packs = args
+        self._kw = kwargs
         self.fragment = fragment
         self.fragment = self.clean()
 
@@ -2313,21 +2583,17 @@ class Variable(Base):
         self.name = fragment
 
     def render(self):
-        if self.args:
-            for item in self.args:
-                if type(item) == dict:
-                    for key in item:
-                        if self.fragment == key:
-                            self.fragment = item[key]
-                elif type(item) == tuple:
-                    for value in item:
-                        if type(value) == dict:
-                            for key in value:
-                                if self.fragment == key:
-                                    self.fragment = value[key]
-                else:
-                    Messages.out_error("Variable: ожидался dict или tuple с dict в контексте")
-        return str(self.fragment)
+        ctx = {}
+        for pack in self._context_packs:
+            if isinstance(pack, dict):
+                ctx.update(pack)
+            elif isinstance(pack, tuple):
+                for value in pack:
+                    if isinstance(value, dict):
+                        ctx.update(value)
+        ctx.update(self._kw)
+        val = resolve(self.fragment, ctx)
+        return "" if val is None else str(val)
 
 
 class Block(Base):
@@ -2398,6 +2664,11 @@ class Elif(Base):
 regex_tokens = tuple(token for token in tokens.values())
 TOK_REGEX = re.compile(r"(%s.*?%s|%s.*?%s|%s.*?%s)" % regex_tokens)
 
+TEMPLATE_EXTENDS_PATTERN = re.compile(r"\{%\s*extends\s+[\"']([^\"']+)[\"']\s*%\}")
+TEMPLATE_BLOCK_PAIR_PATTERN = re.compile(
+    r"\{%\s*block\s+(\w+)\s*%\}(.*?)\{%\s*endblock\s*%\}", re.DOTALL
+)
+
 
 class Fragment(object):
     """Фрагмент исходного текста шаблона с определением типа лексемы."""
@@ -2445,10 +2716,11 @@ class Compiler(object):
         Дополнительные позиционные и именованные аргументы передаются в узлы
         переменных (например, render("x.html", key=value)).
     """
-    def __init__(self, template: str, *args, **kwargs):
+    def __init__(self, template, *args, inline_template=None, **kwargs):
         self.args = args
-        self.template_name = template
+        self.template_name = template if template is not None else "<string>"
         self.kwargs = kwargs
+        self.inline_template = inline_template
 
     def compile(self):
         """
@@ -2457,7 +2729,10 @@ class Compiler(object):
         Returns:
             Собранный HTML без потоковой отдачи.
         """
-        self.template = self.open_file(self.get_template_path())
+        if self.inline_template is not None:
+            self.template = self.inline_template
+        else:
+            self.template = self.open_file(self.get_template_path())
         nodes = []
         new_node = []
         for fragment in self.each_fragment():
@@ -2489,6 +2764,8 @@ class Compiler(object):
             node_class = Text
             if cmd == "block":
                 node_class = Block
+            elif cmd == "include":
+                return Include(fragment.clean, self.args, self.kwargs)
             elif cmd == "if":
                 node_class = If
             elif cmd == "else":
@@ -2528,20 +2805,125 @@ class Compiler(object):
             html = file.read()
             return html
 
+    @classmethod
+    def compile_string(cls, source, *args, **kwargs):
+        """Компилирует фрагмент шаблона (для блоков и наследования)."""
+        return cls("<string>", *args, inline_template=source, **kwargs).compile()
+
+
+def merge_template_inheritance(child_raw, load_parent, *args, **rkwargs):
+    """Склеивает child (extends + blocks) с родительским шаблоном."""
+    if not TEMPLATE_EXTENDS_PATTERN.search(child_raw):
+        return None
+    parent_rel = TEMPLATE_EXTENDS_PATTERN.search(child_raw).group(1).strip()
+    child_body = TEMPLATE_EXTENDS_PATTERN.sub("", child_raw, count=1).strip()
+    blocks_raw = dict(TEMPLATE_BLOCK_PAIR_PATTERN.findall(child_body))
+    parent_raw = load_parent(parent_rel)
+    rendered = {
+        n: Compiler.compile_string(body, *args, **rkwargs) for n, body in blocks_raw.items()
+    }
+
+    def repl(mo):
+        name = mo.group(1)
+        default = mo.group(2)
+        if name in rendered:
+            return rendered[name]
+        return default
+
+    merged = TEMPLATE_BLOCK_PAIR_PATTERN.sub(repl, parent_raw)
+    for _ in range(128):
+        if not TEMPLATE_BLOCK_PAIR_PATTERN.search(merged):
+            break
+        merged = TEMPLATE_BLOCK_PAIR_PATTERN.sub(lambda m: m.group(2), merged)
+    return merged
+
 
 def render(template: str, *args, **kwargs):
     """
     Собирает HTML по имени файла шаблона и контексту.
 
+    Поддерживаются наследование шаблонов (extends), блоки block и endblock, подключение include.
+
     Args:
         template: Путь к файлу относительно settings.TEMPLATE_DIRS.
         *args: Дополнительные позиционные аргументы для узлов переменных.
-        **kwargs: Именованный контекст для подстановок {{ }}.
+        **kwargs: Именованный контекст для подстановок в двойных фигурных скобках.
 
     Returns:
         Строка с готовым HTML.
     """
-    return Compiler(template, *args, **kwargs).compile()
+    c0 = Compiler(template, *args, **kwargs)
+    raw = c0.open_file(c0.get_template_path())
+    base_dir = os.path.dirname(c0.get_template_path())
+    root = os.path.abspath(
+        getattr(settings, "TEMPLATE_DIRS", os.path.join(os.getcwd(), "templates"))
+    )
+
+    def load_parent(rel):
+        rp = os.path.normpath(os.path.join(base_dir, rel))
+        arp = os.path.abspath(rp)
+        if arp != root and not arp.startswith(root + os.sep):
+            raise ValueError("template path outside TEMPLATE_DIRS")
+        with open(rp, encoding="utf-8") as fh:
+            return fh.read()
+
+    if TEMPLATE_EXTENDS_PATTERN.search(raw):
+        merged = merge_template_inheritance(raw, load_parent, *args, **kwargs)
+        return Compiler(template, *args, inline_template=merged, **kwargs).compile()
+    return Compiler(template, *args, inline_template=raw, **kwargs).compile()
+
+
+class WsgiTestClient:
+    """
+    Минимальный in-process клиент к WSGI-приложению без сети.
+
+    Notes:
+        Вызов вида WsgiTestClient(приложение).get("/path") возвращает кортеж (код ответа, список заголовков, тело в байтах).
+    """
+    def __init__(self, app):
+        self.app = app
+
+    def send_wsgi_request(self, method, path, query_string="", body=b"", headers=None, **extra):
+        hdrs = headers or {}
+        env = {
+            "REQUEST_METHOD": method.upper(),
+            "SCRIPT_NAME": "",
+            "PATH_INFO": path,
+            "QUERY_STRING": query_string,
+            "CONTENT_TYPE": hdrs.get("Content-Type", ""),
+            "CONTENT_LENGTH": str(len(body)),
+            "SERVER_NAME": "localhost",
+            "SERVER_PORT": "80",
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": "http",
+            "wsgi.input": io.BytesIO(body),
+            "wsgi.errors": sys.stderr,
+            "wsgi.multithread": False,
+            "wsgi.multiprocess": True,
+            "wsgi.run_once": False,
+        }
+        for hk, hv in hdrs.items():
+            k = hk.upper().replace("-", "_")
+            if k not in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+                env["HTTP_" + k] = hv
+        env.update(extra)
+        out = []
+        err_holder = []
+
+        def sr(status, headers, exc_info=None):
+            err_holder[:] = [status, headers, exc_info]
+
+        body_iter = self.app(env, sr)
+        payload = b"".join(body_iter)
+        status_line = err_holder[0] if err_holder else "500 Internal Server Error"
+        code = int(status_line.split()[0])
+        return code, err_holder[1] if len(err_holder) > 1 else [], payload
+
+    def get(self, path, **kwargs):
+        return self.send_wsgi_request("GET", path, **kwargs)
+
+    def post(self, path, body=b"", **kwargs):
+        return self.send_wsgi_request("POST", path, body=body, **kwargs)
 
 
 # **********************************************************************
@@ -2675,8 +3057,8 @@ class Management:
         Utilities.FileSystem.create_folder("templates/errors")
         Messages.info_create_folder("templates/errors")
         self.create_errors_html_pages()
-        Utilities.FileSystem.create_file(name="static/css/stonecrab.css", content="")
-        Messages.info_create_file("static/css/stonecrab.css")
+        Utilities.FileSystem.create_file(name="static/css/app.css", content="")
+        Messages.info_create_file("static/css/app.css")
         self.create_settings()
         self.create_wsgi()
         self.startapp(name="index", url_prefix="")
