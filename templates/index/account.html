@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Читательский билет</h1>
+<p>Имя и счётчик визитов хранятся в <strong>сессии</strong> (память процесса). Cookie подписывается при заданном <code>SECRET_KEY</code>.</p>
+<p><span class="badge badge--ok">Счётчик визитов: {{ visit_count }}</span></p>
+<p>Имя в сессии: <strong>{{ demo_user }}</strong></p>
+<form method="post" action="/account/" class="card" style="margin-top:1.5rem;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="field">
+    <label for="display_name">Имя на сайте</label>
+    <input id="display_name" name="display_name" value="{{ display_name }}" placeholder="Как к вам обращаться">
+  </div>
+  <button type="submit" class="btn">Сохранить</button>
+</form>
+<p style="margin-top:1.5rem;"><a class="btn btn--ghost" href="/auth/demo/">Войти как демо-пользователь</a> (редирект обратно сюда)</p>
+<p class="footer-links"><a href="/api/session/">Сырой JSON сессии</a> (GET)</p>
+{% endblock %}

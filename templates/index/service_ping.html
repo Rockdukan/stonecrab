@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Служебный ping</h1>
+<p><span class="badge">routes.urls</span> Этот путь подключён <strong>только</strong> из словаря <code>urls</code> в <code>routes.py</code>, без декоратора <code>@route</code>.</p>
+<p class="lab-value">{{ message }}</p>
+<p><a href="/books/">← Каталог</a></p>
+{% endblock %}

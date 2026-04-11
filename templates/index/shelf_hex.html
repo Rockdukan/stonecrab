@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block body %}
+<p><span class="badge">hex2</span></p>
+<h1>Полка {{ code }}</h1>
+<p>Демонстрация пользовательского конвертера пути (два hex-символа). Список книг фонда:</p>
+{{ book_list_html }}
+<p><a href="/books/">Каталог</a></p>
+{% endblock %}

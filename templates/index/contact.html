@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Вопрос библиотекарю</h1>
+<p>Форма с полем <code>csrf_token</code> (проверка CSRF).</p>
+<form method="post" action="/contact/" class="card">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="field">
+    <label for="subject">Тема</label>
+    <input id="subject" name="subject" value="{{ subject }}">
+  </div>
+  <div class="field">
+    <label for="body">Текст</label>
+    <textarea id="body" name="body">{{ body }}</textarea>
+  </div>
+  <button type="submit" class="btn">Отправить</button>
+</form>
+{% endblock %}

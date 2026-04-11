@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="140" height="210" viewBox="0 0 140 210">
+  <rect width="140" height="210" fill="#713f12"/>
+  <ellipse cx="70" cy="85" rx="40" ry="25" fill="#ca8a04" opacity="0.4"/>
+  <text x="70" y="165" fill="#fde68a" text-anchor="middle" font-size="10" font-family="sans-serif">Sapiens</text>
+</svg>

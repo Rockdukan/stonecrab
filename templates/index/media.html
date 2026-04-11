@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Загрузка обложки</h1>
+<p><code>multipart/form-data</code>, поля в <code>request.POST</code>, файл в <code>request.FILES</code>.</p>
+<form method="post" action="/media/" enctype="multipart/form-data" class="card">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="field">
+    <label for="caption">Подпись</label>
+    <input id="caption" name="caption" value="" placeholder="описание">
+  </div>
+  <div class="field">
+    <label for="file">Файл</label>
+    <input id="file" type="file" name="file">
+  </div>
+  <button type="submit" class="btn">Загрузить</button>
+</form>
+{% endblock %}

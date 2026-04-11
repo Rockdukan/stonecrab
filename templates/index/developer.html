@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Служебные ссылки</h1>
+<p class="hero" style="border:none;padding:0;">Технические эндпоинты и проверки (не часть сюжета библиотеки).</p>
+<div class="grid">
+  <article class="card">
+    <h2>Health</h2>
+    <a class="btn" href="/health">/health</a>
+  </article>
+  <article class="card">
+    <h2>OpenAPI</h2>
+    <a class="btn" href="/openapi.json">/openapi.json</a>
+  </article>
+  <article class="card">
+    <h2>Пример операции</h2>
+    <a class="btn btn--ghost" href="/openapi-sample/">/openapi-sample/</a>
+  </article>
+  <article class="card">
+    <h2>JSON сессии</h2>
+    <a class="btn btn--ghost" href="/api/session/">GET</a>
+  </article>
+  <article class="card">
+    <h2>Метрики</h2>
+    <a class="btn btn--ghost" href="/metrics-check/">запрос</a>
+  </article>
+  <article class="card">
+    <h2>Редирект</h2>
+    <a class="btn btn--ghost" href="/redirect-example/">на каталог</a>
+  </article>
+  <article class="card">
+    <h2>Ошибка 500</h2>
+    <a class="btn btn--ghost" href="/boom/">вызвать</a>
+  </article>
+  <article class="card">
+    <h2>Ping из urls</h2>
+    <a class="btn btn--ghost" href="/service/ping/">/service/ping/</a>
+  </article>
+</div>
+<section class="card" style="margin-top:2rem;">
+  <h2>Idempotency-Key</h2>
+  <div class="pre">curl -s -X POST http://127.0.0.1:8000/idempo-echo/ \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -H "X-CSRF-Token: &lt;токен&gt;" \
+  -H "Idempotency-Key: once" -d "x=1"</div>
+</section>
+<p><a href="/">← Главная</a></p>
+{% endblock %}

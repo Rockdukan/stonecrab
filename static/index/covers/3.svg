@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="140" height="210" viewBox="0 0 140 210">
+  <rect width="140" height="210" fill="#14532d"/>
+  <path d="M35 140 L70 60 L105 140 Z" fill="#22c55e" opacity="0.5"/>
+  <text x="70" y="175" fill="#bbf7d0" text-anchor="middle" font-size="9" font-family="monospace">CODE</text>
+</svg>

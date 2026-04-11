@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block body %}
+<section class="hero">
+  <h1>Добро пожаловать</h1>
+  <p>Каталог книг с обложками: жанры, карточка издания, добавление в фонд, загрузка файла. Сайт на корне <code>/</code>.</p>
+</section>
+<h2>Новинки и хиты</h2>
+<div class="grid">
+{{ featured_cards_html }}
+</div>
+<h2>Жанры</h2>
+{{ genres_html }}
+<p class="footer-links">Пример UUID в пути: <a href="/books/doc/{{ demo_uuid }}/">справка</a> · полка <a href="/shelf/ab/">ab</a></p>
+{% endblock %}

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} — библиотека</title>
+  <link rel="stylesheet" href="{% static "index/theme.css" %}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <div class="site-brand"><a href="/">Городская библиотека</a></div>
+      <nav class="site-nav">
+        <a href="/">Главная</a>
+        <a href="/books/">Каталог</a>
+        <a href="/books/add/">Добавить книгу</a>
+        <a href="/account/">Читательский билет</a>
+        <a href="/contact/">Вопрос библиотекарю</a>
+        <a href="/media/">Обложка (файл)</a>
+        <a href="/developer/">Сервис</a>
+      </nav>
+    </div>
+  </header>
+  <main class="site-main">
+    {% block body %}{% endblock %}
+  </main>
+</body>
+</html>

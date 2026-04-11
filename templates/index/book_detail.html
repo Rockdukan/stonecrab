@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block body %}
+<p><span class="badge">id: {{ book.id }}</span></p>
+<div class="book-detail">
+  <div class="book-detail__cover">
+    <img src="{{ book.cover_src }}" width="200" height="300" alt="">
+  </div>
+  <div class="book-detail__body">
+    <h1>{{ book.title }}</h1>
+    <p><strong>{{ book.author }}</strong>, {{ book.year }}</p>
+    <p>Жанр: <a href="/genre/{{ book.genre }}/">{{ book.genre }}</a></p>
+    <p>{{ book.synopsis }}</p>
+    <p><a class="btn" href="/books/">← Каталог</a></p>
+  </div>
+</div>
+{% endblock %}

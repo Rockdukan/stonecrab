@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Добавить книгу в каталог</h1>
+{{ error_block }}
+<form method="post" action="/books/add/" class="card">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="field">
+    <label for="title">Название</label>
+    <input id="title" name="title" required>
+  </div>
+  <div class="field">
+    <label for="author">Автор</label>
+    <input id="author" name="author" required>
+  </div>
+  <div class="field">
+    <label for="year">Год издания</label>
+    <input id="year" name="year" type="text" inputmode="numeric" pattern="[0-9]{4}" placeholder="1999" required>
+  </div>
+  <div class="field">
+    <label for="genre">Жанр (латиница, например klassika)</label>
+    <input id="genre" name="genre" required>
+  </div>
+  <div class="field">
+    <label for="synopsis">Аннотация</label>
+    <textarea id="synopsis" name="synopsis"></textarea>
+  </div>
+  <button type="submit" class="btn">Сохранить</button>
+</form>
+{% endblock %}
